@@ -1,7 +1,8 @@
 import { Box3, DirectionalLight, HemisphereLight, Mesh, PerspectiveCamera, Scene, Vector3, WebGLRenderer } from 'three';
 import { FURNITURE_CATALOG, createFurnitureModel } from '../models/catalog';
+import type { FurnitureColor } from '../models/types';
 
-export function generateThumbnails(): Record<string, string> {
+export function generateThumbnails(color: FurnitureColor = 'walnut'): Record<string, string> {
   const renderer = new WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
   renderer.setSize(132, 96);
   renderer.setPixelRatio(1);
@@ -15,7 +16,7 @@ export function generateThumbnails(): Record<string, string> {
   const result: Record<string, string> = {};
 
   for (const definition of FURNITURE_CATALOG) {
-    const model = createFurnitureModel(definition.id, 'oak');
+    const model = createFurnitureModel(definition.id, color);
     scene.add(model);
     const bounds = new Box3().setFromObject(model);
     const center = bounds.getCenter(new Vector3());

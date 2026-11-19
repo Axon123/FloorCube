@@ -1,4 +1,5 @@
 import type { FloorPlan, FurnitureItem, Opening, Room, RoomType, Wall } from '../core/schema';
+import { constrainFurnitureLayout } from '../core/layout';
 import type { Vec2 } from '../core/geometry';
 import type { FurnitureModelId } from '../models/catalog';
 import type { FurnitureColor } from '../models/types';
@@ -306,10 +307,10 @@ export interface DemoEntry {
 }
 
 export const DEMO_PLANS: DemoEntry[] = [
-  { id: 'one-bed', title: '暖阳一居', subtitle: '42㎡ · 一室一厅', area: 42, plan: oneBed },
-  { id: 'two-bed', title: '双卧家庭', subtitle: '69㎡ · 两室两厅', area: 69, plan: twoBed },
-  { id: 'three-bed', title: '三室朝阳', subtitle: '101㎡ · 三室两厅', area: 101, plan: threeBed },
-  { id: 'l-shape', title: '折线手枪户型', subtitle: '44㎡ · 异形空间', area: 44, plan: lShape },
+  { id: 'one-bed', title: '暖阳一居', subtitle: '42㎡ · 一室一厅', area: 42, plan: constrainFurnitureLayout(oneBed).plan },
+  { id: 'two-bed', title: '双卧家庭', subtitle: '69㎡ · 两室两厅', area: 69, plan: constrainFurnitureLayout(twoBed).plan },
+  { id: 'three-bed', title: '三室朝阳', subtitle: '101㎡ · 三室两厅', area: 101, plan: constrainFurnitureLayout(threeBed).plan },
+  { id: 'l-shape', title: '折线手枪户型', subtitle: '44㎡ · 异形空间', area: 44, plan: constrainFurnitureLayout(lShape).plan },
 ];
 
 export function getDemoPlan(id: string): FloorPlan {

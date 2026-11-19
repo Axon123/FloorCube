@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { RecognitionError, parseModelJson } from './client';
+import { describe, expect, it, vi } from 'vitest';
+import { RecognitionError, parseModelJson, recognizeFloorPlan } from './client';
 
 const PLAN = '{"version":1,"name":"测试","unit":"m","wallHeight":2.8,"walls":[{"id":"w1","start":[0,0],"end":[4,0],"thickness":0.24,"confidence":0.9}],"openings":[],"rooms":[{"id":"r1","name":"客厅","type":"living","polygon":[[0,0],[4,0],[4,3],[0,3]],"confidence":0.9}],"furniture":[]}';
 
@@ -40,6 +40,26 @@ describe('parseModelJson', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(RecognitionError);
       expect((error as RecognitionError).raw).toContain('抱歉');
+    }
+  });
+});
+
+describe('识别提示词', () => {
+  it('明确家具正方向、模糊图像处理和高频贴墙规则', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: PLAN } }],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await recognizeFloorPlan({ baseUrl: 'https://example.com/v1', apiKey: 'test-only', model: 'qwen-vl-max' }, 'data:image/png;base64,AA==');
+      const body = JSON.parse(String(fetchMock.mock.calls[0][1].body));
+      const prompt = body.messages[1].content[0].text as string;
+      expect(prompt).toContain('[sin(rotation),cos(rotation)]');
+      expect(prompt).toContain('马桶水箱、床头、沙发靠背');
+      expect(prompt).toContain('前后特征模糊时');
+      expect(prompt).toContain('不根据房间用途凭空添加');
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });

@@ -27,10 +27,12 @@ const USER_PROMPT = `请识别这张户型图纸照片，输出结构化 JSON。
 1. 尽量读取图纸标注尺寸；若没有标注，按标准门宽约 0.9m 推算比例，scaleSource 填 "door-reference"，有标注填 "annotation"。
 2. walls 覆盖外墙与内墙，thickness 常见 0.12~0.24；rooms 覆盖所有可识别房间，type 只能是 bedroom/living/kitchen/bathroom/balcony/dining/study/entry/other。
 3. openings 的 wallId 必须引用 walls.id；door 高度约 2.1、sillHeight 0；window 高度约 1.2~1.5、sillHeight 约 0.9。
-4. 对不确定的墙或房间给较低 confidence（0~1），不要编造不存在的空间。
-5. furniture 输出空数组 []，家具由用户后续摆放。
-6. 输出紧凑单行 JSON：不要换行与多余空格，不要 Markdown 代码块，不要任何解释文字。
-7. 只输出如下 Schema 的 JSON：
+4. 对模糊、被遮挡或无法确认的墙和房间给较低 confidence（0~1），不要编造不存在的空间。
+5. furniture 只输出图中明确画出且能辨认类别的家具，不根据房间用途凭空添加；没有清晰家具时输出 []。model 仅支持 bed-double/bed-single/wardrobe/nightstand/desk/sofa/coffee-table/tv-console/bookshelf/floor-lamp/dining-table/dining-chair/fridge/kitchen-cabinet/stove/toilet/vanity/bathtub/shower/plant/rug/accent-chair。数组元素格式为 {"id":"f1","model":"toilet","roomId":"r1","position":[1,1],"rotation":0,"color":"walnut"}；position 是家具中心点，roomId 必须引用 rooms.id，color 只能是 walnut/oak/sage。
+6. rotation 使用弧度，优先取 0、1.5708、3.1416、-1.5708。所有家具正面均为模型局部 +z，在图纸平面中的正方向为 [sin(rotation),cos(rotation)]：0 朝 +y，1.5708 朝 +x，3.1416 朝 -y，-1.5708 朝 -x。先辨认家具自身前后特征，再换算 rotation，不要把图像上方直接当成家具背面。
+7. 马桶水箱、床头、沙发靠背和柜体背面应靠近实墙，马桶座圈前方、床尾、沙发座位前方和柜门应朝房间内可用空间，不得朝向墙体或紧贴其他家具。前后特征模糊时，结合最近实墙和可用空间判断，不要按图纸上下方向臆测；类别或位置也不清晰时不要输出该家具。
+8. 输出紧凑单行 JSON：不要换行与多余空格，不要 Markdown 代码块，不要任何解释文字。
+9. 只输出如下 Schema 的 JSON：
 {"version":1,"name":"户型名称","unit":"m","scaleSource":"annotation|door-reference","totalAreaHint":数字或省略,"wallHeight":2.8,"walls":[{"id":"w1","start":[0,0],"end":[4.2,0],"thickness":0.24,"confidence":0.9}],"openings":[{"id":"o1","wallId":"w1","type":"door|window","offset":1.2,"width":0.9,"height":2.1,"sillHeight":0}],"rooms":[{"id":"r1","name":"主卧","type":"bedroom","polygon":[[0,0],[4.2,0],[4.2,3.6],[0,3.6]],"confidence":0.9}],"furniture":[]}`;
 
 function endpoint(config: ModelConfig) {

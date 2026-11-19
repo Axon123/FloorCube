@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { DEMO_PLANS, getDemoPlan } from '../data/demos';
+import { constrainFurnitureLayout } from './layout';
 import { validateFurniture } from './placement';
 import { emptyPlan, normalizeFloorPlan, planArea, scalePlan } from './schema';
+import type { FloorPlan } from './schema';
+import type { FurnitureModelId } from '../models/catalog';
+import type { Vec2 } from './geometry';
 import { PlanStore } from './store';
 
 describe('示例户型数据', () => {
@@ -58,6 +62,62 @@ describe('AI 输出容错解析', () => {
   it('完全无效输入抛出可读错误', () => {
     expect(() => normalizeFloorPlan({ foo: 1 })).toThrowError();
     expect(() => normalizeFloorPlan(null)).toThrowError();
+  });
+});
+
+describe('家具生成后约束', () => {
+  function planWithFurniture(model: FurnitureModelId, position: Vec2, rotation: number): FloorPlan {
+    const plan = normalizeFloorPlan({
+      walls: [
+        { id: 'w1', start: [0, 0], end: [4, 0], thickness: 0.24 },
+        { id: 'w2', start: [4, 0], end: [4, 3], thickness: 0.24 },
+        { id: 'w3', start: [4, 3], end: [0, 3], thickness: 0.24 },
+        { id: 'w4', start: [0, 3], end: [0, 0], thickness: 0.24 },
+      ],
+      openings: [{ id: 'o1', wallId: 'w2', type: 'door', offset: 1, width: 0.9 }],
+      rooms: [{ id: 'r1', name: '卫生间', type: 'bathroom', polygon: [[0, 0], [4, 0], [4, 3], [0, 3]], confidence: 0.9 }],
+      furniture: [],
+    });
+    plan.furniture.push({ id: 'f1', model, position, rotation, color: 'walnut', roomId: 'r1' });
+    return plan;
+  }
+
+  it.each([
+    ['toilet', [2, 0.45] as Vec2],
+    ['bed-double', [2, 1.05] as Vec2],
+    ['sofa', [2, 0.5] as Vec2],
+  ] as const)('把背向房间、面朝墙体的 %s 转到可用空间', (model, position) => {
+    const original = planWithFurniture(model, position, Math.PI);
+    const result = constrainFurnitureLayout(original);
+    expect(result.unplaced).toBe(0);
+    expect(result.adjusted).toBe(1);
+    expect(result.plan.furniture[0].rotation).toBe(0);
+    expect(original.furniture[0].rotation).toBe(Math.PI);
+    expect(validateFurniture(result.plan, model, position, 0, 'f1').valid).toBe(true);
+  });
+
+  it('没有明确更优方向时保留原朝向', () => {
+    const original = planWithFurniture('toilet', [2, 1.5], Math.PI);
+    const result = constrainFurnitureLayout(original);
+    expect(result.adjusted).toBe(0);
+    expect(result.plan.furniture[0].rotation).toBe(Math.PI);
+  });
+
+  it('禁止家具占用门内通行区', () => {
+    const plan = planWithFurniture('dining-chair', [3.55, 1.45], 0);
+    expect(validateFurniture(plan, 'dining-chair', [3.55, 1.45], 0, 'f1').reason).toBe('家具挡住门口通行区域');
+    expect(validateFurniture(plan, 'dining-chair', [1, 1.5], 0, 'f1').valid).toBe(true);
+  });
+
+  it('把堵门或重叠家具移到最近的安全位置', () => {
+    const plan = planWithFurniture('dining-chair', [3.55, 1.45], 0);
+    plan.furniture.push({ id: 'f2', model: 'dining-chair', position: [3.55, 1.45], rotation: 0, color: 'oak', roomId: 'r1' });
+    const result = constrainFurnitureLayout(plan);
+    expect(result.unplaced).toBe(0);
+    expect(result.plan.furniture).toHaveLength(2);
+    for (const item of result.plan.furniture) {
+      expect(validateFurniture(result.plan, item.model, item.position, item.rotation, item.id).valid).toBe(true);
+    }
   });
 });
 

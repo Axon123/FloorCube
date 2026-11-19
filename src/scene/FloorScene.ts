@@ -13,8 +13,6 @@ import {
   PerspectiveCamera,
   PCFShadowMap,
   Plane,
-  Points,
-  PointsMaterial,
   Raycaster,
   Scene,
   Shape,
@@ -25,7 +23,6 @@ import {
   WebGLRenderer,
   BoxGeometry,
   BufferGeometry,
-  Float32BufferAttribute,
 } from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { CSS2DObject, CSS2DRenderer } from 'three/addons/renderers/CSS2DRenderer.js';
@@ -39,6 +36,7 @@ import type { PlanStore } from '../core/store';
 import { createFurnitureModel, getFurnitureDefinition } from '../models/catalog';
 import type { FurnitureModelId } from '../models/catalog';
 import { material } from '../models/primitives';
+import type { FurnitureColor } from '../models/types';
 
 export interface SceneSettings {
   wallMode: 'solid' | 'ghost' | 'low';
@@ -87,7 +85,7 @@ interface DragState {
 
 function disposeObject(object: Object3D) {
   object.traverse((child) => {
-    if (child instanceof Mesh || child instanceof Points) {
+    if (child instanceof Mesh) {
       const geometry = child.geometry as BufferGeometry;
       if (!geometry.userData.shared) geometry.dispose();
       const materials = Array.isArray(child.material) ? child.material : [child.material];
@@ -110,7 +108,6 @@ export class FloorScene {
   private labelGroup = new Group();
   private baseGroup = new Group();
   private grid: GridHelper | null = null;
-  private particles: Points;
   private keyLight: DirectionalLight;
   private raycaster = new Raycaster();
   private groundPlane = new Plane(new Vector3(0, 1, 0), 0);
@@ -145,8 +142,8 @@ export class FloorScene {
     this.labelRenderer.domElement.className = 'label-layer';
     this.container.appendChild(this.labelRenderer.domElement);
 
-    this.scene.background = new Color(0x202723);
-    this.scene.fog = new Fog(0x202723, 24, 52);
+    this.scene.background = new Color(0xe6e5df);
+    this.scene.fog = new Fog(0xe6e5df, 28, 58);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
@@ -177,15 +174,6 @@ export class FloorScene {
     const fill = new DirectionalLight(0xffe7cf, 0.5);
     fill.position.set(0, 4, -7);
     this.scene.add(fill);
-
-    const particleGeometry = new BufferGeometry();
-    const positions: number[] = [];
-    for (let index = 0; index < 140; index += 1) {
-      positions.push((Math.random() - 0.5) * 24, Math.random() * 7 + 0.4, (Math.random() - 0.5) * 24);
-    }
-    particleGeometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
-    this.particles = new Points(particleGeometry, new PointsMaterial({ color: 0xffe6ad, size: 0.035, transparent: true, opacity: 0.42, depthWrite: false }));
-    this.scene.add(this.particles);
 
     this.scene.add(this.baseGroup, this.planGroup, this.furnitureGroup, this.labelGroup);
 
@@ -221,14 +209,10 @@ export class FloorScene {
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
     if (previousAspect > 0 && Math.abs(previousAspect - this.camera.aspect) > 0.02) {
-      const previousFactor = Math.max(1, 1 / Math.max(previousAspect, 0.35));
-      const nextFactor = Math.max(1, 1 / Math.max(this.camera.aspect, 0.35));
-      const ratio = nextFactor / previousFactor;
-      if (Math.abs(ratio - 1) > 0.01) {
-        const offset = this.camera.position.clone().sub(this.controls.target).multiplyScalar(ratio);
-        this.camera.position.copy(this.controls.target).add(offset);
-        this.controls.update();
-      }
+      const ratio = previousAspect / this.camera.aspect;
+      const offset = this.camera.position.clone().sub(this.controls.target).multiplyScalar(ratio);
+      this.camera.position.copy(this.controls.target).add(offset);
+      this.controls.update();
     }
   }
 
@@ -246,7 +230,6 @@ export class FloorScene {
     // 阻尼按帧衰减会导致低帧率设备惯性拖尾数倍变长，换算成按时间衰减保持手感一致
     this.controls.dampingFactor = Math.min(0.9, Math.max(0.02, 1 - Math.pow(1 - 0.075, rawDelta * 60)));
     this.controls.update(delta);
-    this.particles.rotation.y += delta * 0.018;
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
     const phase = !this.settings.autoRotate ? 'off' : this.orbitHeld ? 'drag' : idleMs <= ORBIT_HOLD_MS ? 'hold' : 'off';
@@ -474,12 +457,12 @@ export class FloorScene {
     this.renderer.shadowMap.needsUpdate = true;
   }
 
-  setPlacement(model: FurnitureModelId | null) {
+  setPlacement(model: FurnitureModelId | null, color: FurnitureColor = 'walnut') {
     this.placementModel = model;
     this.clearGhost();
     this.controls.enableRotate = !model;
     if (model) {
-      this.ghost = createFurnitureModel(model, 'oak');
+      this.ghost = createFurnitureModel(model, color);
       this.ghost.traverse((child) => {
         if (child instanceof Mesh) {
           const source = child.material as MeshStandardMaterial;
