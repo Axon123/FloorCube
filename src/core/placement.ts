@@ -53,6 +53,35 @@ export function furnitureCorners(item: Pick<FurnitureItem, 'model' | 'position' 
   return rectangleCorners(position, definition.dimensions.width, definition.dimensions.depth, rotation);
 }
 
+function doorClearanceZones(plan: FloorPlan, room: FloorPlan['rooms'][number], position: Vec2) {
+  const zones: Vec2[][] = [];
+  for (const opening of plan.openings) {
+    if (opening.type !== 'door') continue;
+    const wall = plan.walls.find((candidate) => candidate.id === opening.wallId);
+    if (!wall) continue;
+    const dx = wall.end[0] - wall.start[0];
+    const dy = wall.end[1] - wall.start[1];
+    const length = Math.hypot(dx, dy) || 1;
+    const along = Math.min(1, (opening.offset + opening.width / 2) / length);
+    const doorPoint: Vec2 = [wall.start[0] + dx * along, wall.start[1] + dy * along];
+    const onRoomBoundary = room.polygon.some((point, index) => distanceToSegment(
+      doorPoint,
+      point,
+      room.polygon[(index + 1) % room.polygon.length],
+    ) < Math.max(0.06, wall.thickness * 0.75));
+    if (!onRoomBoundary) continue;
+    let normal: Vec2 = [-dy / length, dx / length];
+    const towardRoom = (position[0] - doorPoint[0]) * normal[0] + (position[1] - doorPoint[1]) * normal[1];
+    if (towardRoom < 0) normal = [-normal[0], -normal[1]];
+    if (Math.abs(towardRoom) < 0.01) continue;
+    const depth = 0.65;
+    const offset = wall.thickness / 2 + depth / 2;
+    const center: Vec2 = [doorPoint[0] + normal[0] * offset, doorPoint[1] + normal[1] * offset];
+    zones.push(rectangleCorners(center, opening.width + 0.2, depth, Math.atan2(normal[0], normal[1])));
+  }
+  return zones;
+}
+
 export function validateFurniture(
   plan: FloorPlan,
   model: FurnitureModelId,
@@ -88,6 +117,11 @@ export function validateFurniture(
       ];
       if (polygonsIntersect(corners, wallPolygon) && overlapDepth(corners, wallPolygon) > 0.06) {
         return { valid: false, reason: '家具与墙体碰撞', roomId: room.id };
+      }
+    }
+    for (const zone of doorClearanceZones(plan, room, position)) {
+      if (overlapDepth(corners, zone) > 0.05) {
+        return { valid: false, reason: '家具挡住门口通行区域', roomId: room.id };
       }
     }
   }

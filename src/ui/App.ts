@@ -1,7 +1,7 @@
 import { DEFAULT_BASE_URL, DEFAULT_MODEL, DEEPSEEK_BASE_URL, MODEL_PRESETS, RecognitionError, fileToDataUrl, recognizeFloorPlan, testConnection, validateImageFile } from '../ai/client';
 import type { RecognitionStage } from '../ai/client';
 import { polygonArea } from '../core/geometry';
-import { smartLayout } from '../core/layout';
+import { constrainFurnitureLayout, smartLayout } from '../core/layout';
 import { validateFurniture } from '../core/placement';
 import { emptyPlan, normalizeFloorPlan, planArea, roomTypeName, scalePlan, uid, wallLength, ROOM_TYPES } from '../core/schema';
 import type { ModelConfig, RoomType } from '../core/schema';
@@ -21,7 +21,25 @@ import type { SceneSettings } from '../scene/FloorScene';
 import { generateThumbnails } from './thumbnails';
 
 type ViewMode = '3d' | '2d' | 'split';
-type SidebarTab = 'furniture' | 'rooms' | 'projects';
+type SidebarTab = 'furniture' | 'rooms' | 'projects' | 'scene';
+
+const ICONS = {
+  upload: '<path d="M12 16V4m0 0L7 9m5-5 5 5M5 14v5h14v-5"/>',
+  save: '<path d="M5 4h12l2 2v14H5V4Z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/>',
+  export: '<path d="M12 15V3m0 0L8 7m4-4 4 4M5 12v8h14v-8"/>',
+  settings: '<circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.6-1.4.9-1.9-2.1-2.1-1.9.9-1.4-.6-.7-2h-3l-.7 2-1.4.6-1.9-.9-2.1 2.1.9 1.9-.6 1.4-2 .7v3l2 .7.6 1.4-.9 1.9 2.1 2.1 1.9-.9 1.4.6.7 2h3l.7-2 1.4-.6 1.9.9 2.1-2.1-.9-1.9.6-1.4 2-.7Z"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/>',
+  play: '<path d="m9 6 9 6-9 6V6Z"/>',
+  undo: '<path d="m9 7-5 5 5 5M5 12h8a6 6 0 0 1 6 6"/>',
+  redo: '<path d="m15 7 5 5-5 5m4-5h-8a6 6 0 0 0-6 6"/>',
+  reset: '<path d="M4 10a8 8 0 1 1 2 7M4 10V4m0 6h6"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  close: '<path d="m6 6 12 12M18 6 6 18"/>',
+};
+
+function icon(name: keyof typeof ICONS) {
+  return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name]}</svg>`;
+}
 
 function escapeHtml(value: string) {
   return value.replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]!));
@@ -52,7 +70,7 @@ function openModal(title: string, body: string, options: { wide?: boolean; onClo
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
     <div class="modal ${options.wide ? 'modal-wide' : ''}" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
-      <header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-button modal-close" type="button" aria-label="关闭">×</button></header>
+      <header class="modal-header"><h2>${escapeHtml(title)}</h2><button class="icon-button modal-close" type="button" aria-label="关闭">${icon('close')}</button></header>
       <div class="modal-body">${body}</div>
     </div>
   `;
@@ -75,6 +93,7 @@ export class App {
   private scene!: FloorScene;
   private editor!: PlanEditor;
   private thumbnails: Record<string, string> = {};
+  private thumbnailCache: Partial<Record<FurnitureColor, Record<string, string>>> = {};
   private settings: SceneSettings = { ...DEFAULT_SCENE_SETTINGS };
   private viewMode: ViewMode = '3d';
   private config: ModelConfig | null = loadConfig();
@@ -83,7 +102,6 @@ export class App {
   private defaultColor: FurnitureColor = 'walnut';
   private libraryCategory = 'all';
   private librarySearch = '';
-  private librarySort = 'default';
   private autosaveTimer = 0;
   private activeModal: ModalHandle | null = null;
   private pendingUploadFile: File | null = null;
@@ -118,7 +136,7 @@ export class App {
     this.updateHistoryButtons();
     this.setViewMode('3d');
     requestAnimationFrame(() => {
-      this.thumbnails = generateThumbnails();
+      this.ensureThumbnails(this.defaultColor);
       this.renderLibrary();
     });
     if (!isOnboarded()) this.showOnboarding();
@@ -133,22 +151,24 @@ export class App {
       <div class="app-frame">
         <header class="topbar">
           <div class="brand">
-            <div class="brand-cube" aria-hidden="true"><span></span><span></span><span></span></div>
-            <div class="brand-copy"><strong>FloorCube</strong><small>户型魔方 · AI 3D 沙盘</small></div>
+            <svg class="brand-mark" viewBox="0 0 40 40" fill="none" aria-hidden="true">
+              <path d="M5 11 20 3l15 8v18l-15 8-15-8V11Z" stroke="currentColor" stroke-width="1.8"/>
+              <path d="m5 11 15 8 15-8M20 19v18M12 15v10l8 4 8-4V15" stroke="currentColor" stroke-width="1.8"/>
+              <path d="m12 7 8 4 8-4" stroke="var(--accent)" stroke-width="2.4"/>
+            </svg>
+            <div class="brand-copy"><strong>FloorCube</strong><small>户型魔方 · 把家摆成立体</small></div>
           </div>
           <div class="demo-controls">
-            <label class="field-inline">示例户型
-              <select id="demo-select">${DEMO_PLANS.map((demo) => `<option value="${demo.id}" ${demo.id === 'two-bed' ? 'selected' : ''}>${demo.title} · ${demo.subtitle}</option>`).join('')}</select>
-            </label>
-            <button id="replay-button" class="ghost-button" type="button">模拟识别演示</button>
+            <span class="demo-label">示例方案</span>
+            <select id="demo-select" aria-label="切换示例方案">${DEMO_PLANS.map((demo) => `<option value="${demo.id}" ${demo.id === 'two-bed' ? 'selected' : ''}>${demo.title} · ${demo.subtitle}</option>`).join('')}</select>
+            <button id="replay-button" class="icon-button" type="button" aria-label="播放模拟识别演示" title="模拟识别演示">${icon('play')}</button>
           </div>
           <div class="top-actions">
-            <button id="upload-button" class="primary-button" type="button">上传户型图</button>
-            <button id="config-button" class="ghost-button" type="button">模型配置</button>
-            <button id="calibrate-button" class="ghost-button" type="button">校准尺寸</button>
-            <button id="save-button" class="ghost-button" type="button">保存</button>
-            <button id="export-button" class="ghost-button" type="button">导出</button>
-            <button id="about-button" class="icon-button" type="button" aria-label="关于与隐私">?</button>
+            <button id="upload-button" class="primary-button" type="button" aria-label="上传户型图">${icon('upload')}<span class="button-label">上传户型图</span></button>
+            <button id="save-button" class="ghost-button" type="button" aria-label="保存方案" title="保存方案">${icon('save')}<span class="button-label">保存</span></button>
+            <button id="export-button" class="ghost-button" type="button" aria-label="导出作品" title="导出作品">${icon('export')}<span class="button-label">导出</span></button>
+            <button id="config-button" class="ghost-button" type="button" aria-label="模型接口设置" title="模型接口设置">${icon('settings')}<span class="button-label">接口</span></button>
+            <button id="about-button" class="icon-button" type="button" aria-label="关于与隐私" title="关于与隐私">${icon('info')}</button>
           </div>
         </header>
 
@@ -157,22 +177,28 @@ export class App {
             <div class="viewport-toolbar">
               <div class="segmented" role="group" aria-label="视图切换">
                 <button data-view="3d" class="active" type="button">3D 沙盘</button>
-                <button data-view="split" type="button">分屏校正</button>
+                <button data-view="split" type="button">分屏</button>
                 <button data-view="2d" type="button">2D 平面</button>
               </div>
               <div class="editor-tools" id="editor-tools">
                 <button data-tool="select" class="active" type="button" title="选择 / 移动">选择</button>
-                <button data-tool="wall" type="button" title="绘制墙体">画墙</button>
-                <button data-tool="door" type="button" title="在墙上添加门">门</button>
-                <button data-tool="window" type="button" title="在墙上添加窗">窗</button>
-                <button data-tool="room" type="button" title="绘制房间">房间</button>
-                <button data-tool="erase" type="button" title="删除元素">删除</button>
+                <button data-tool="wall" type="button" title="拖拽绘制墙体">画墙</button>
+                <button data-tool="door" type="button" title="点击墙体添加门">门</button>
+                <button data-tool="window" type="button" title="点击墙体添加窗">窗</button>
+                <button data-tool="room" type="button" title="拖拽绘制房间">房间</button>
+                <button data-tool="erase" type="button" title="点击删除元素">删除</button>
                 <button id="fit-2d" type="button" title="适配视图">适配</button>
               </div>
               <div class="toolbar-right">
-                <button id="undo-button" class="icon-button" type="button" aria-label="撤销" disabled>↶</button>
-                <button id="redo-button" class="icon-button" type="button" aria-label="重做" disabled>↷</button>
-                <button id="new-plan-button" class="ghost-button" type="button">空白户型</button>
+                <div class="viewport-options">
+                  <label class="compact-field"><span>墙体</span><select id="ctrl-wall-mode" aria-label="墙体显示模式"><option value="low">降墙</option><option value="solid">实体</option><option value="ghost">半透明</option></select></label>
+                  <label class="compact-field"><span>机位</span><select id="ctrl-camera" aria-label="相机机位"><option value="iso">45° 沙盘</option><option value="top">正俯视</option><option value="front">正面斜视</option></select></label>
+                  <button id="camera-reset" class="icon-button" type="button" aria-label="恢复默认机位" title="恢复默认机位">${icon('reset')}</button>
+                </div>
+                <div class="history-controls">
+                  <button id="undo-button" class="icon-button" type="button" aria-label="撤销" title="撤销 ⌘Z" disabled>${icon('undo')}</button>
+                  <button id="redo-button" class="icon-button" type="button" aria-label="重做" title="重做 ⇧⌘Z" disabled>${icon('redo')}</button>
+                </div>
               </div>
             </div>
 
@@ -180,8 +206,8 @@ export class App {
               <div id="scene-container" class="scene-container"></div>
               <div id="editor-container" class="editor-container"></div>
               <div class="viewport-hud">
-                <span class="hud-chip" id="hud-mode">上帝斜俯视 · 拖拽旋转</span>
-                <span class="hud-chip hud-placement hidden" id="hud-placement">点击地面放置家具 · Esc 退出</span>
+                <span class="hud-chip" id="hud-mode">拖拽旋转 · 滚轮缩放</span>
+                <div class="hud-chip hud-placement hidden" id="hud-placement"><span id="placement-name">点击地面放置家具</span><button id="cancel-placement" type="button">完成</button></div>
                 <span class="hud-chip hud-orbit hidden" id="hud-orbit"></span>
               </div>
               <div class="drop-overlay hidden" id="drop-overlay"><strong>松开以上传户型图</strong><span>JPG / PNG / WebP · ≤10MB</span></div>
@@ -189,89 +215,87 @@ export class App {
             </div>
 
             <footer class="statusbar">
-              <span id="status-name"></span>
+              <strong id="status-name"></strong>
               <span id="status-area"></span>
-              <span id="status-scale"></span>
+              <button id="status-scale" type="button" title="校准户型尺寸"></button>
               <span id="status-furniture"></span>
-              <span class="status-hint">不收集任何信息 · 配置仅存浏览器本地</span>
+              <span class="status-hint"><i></i>本地工作区 · 不收集任何信息</span>
             </footer>
           </section>
 
           <aside class="sidebar" id="sidebar">
-            <button id="drawer-toggle" class="drawer-handle" type="button" aria-expanded="false">家具库 · 房间 · 场景控制 <span>⌃</span></button>
-            <div class="sidebar-tabs" role="tablist">
-              <button data-tab="furniture" class="active" type="button">家具库</button>
-              <button data-tab="rooms" type="button">房间</button>
-              <button data-tab="projects" type="button">项目</button>
+            <button id="drawer-toggle" class="drawer-handle" type="button" aria-expanded="false"><span>打开工作台</span><i></i></button>
+            <div class="sidebar-tabs" role="tablist" aria-label="工作台面板">
+              <button data-tab="furniture" class="active" type="button" role="tab">家具</button>
+              <button data-tab="rooms" type="button" role="tab">房间</button>
+              <button data-tab="projects" type="button" role="tab">方案</button>
+              <button data-tab="scene" type="button" role="tab">场景</button>
             </div>
             <div class="sidebar-scroll">
               <section class="tab-panel active" data-panel="furniture">
+                <header class="panel-heading"><div><h2>家具库</h2><p>选一件家具，在户型中点击放置</p></div><span>${FURNITURE_CATALOG.length} 件</span></header>
                 <div class="library-controls">
-                  <input id="library-search" type="search" placeholder="搜索家具…" aria-label="搜索家具" />
-                  <select id="library-sort" aria-label="排序">
-                    <option value="default">默认顺序</option>
-                    <option value="name">按名称</option>
-                    <option value="area">按占地</option>
-                  </select>
+                  <input id="library-search" type="search" placeholder="搜索名称或型号" aria-label="搜索家具" />
                 </div>
                 <div class="category-chips" id="category-chips"></div>
                 <div class="library-meta">
-                  <span>放置配色</span>
-                  <select id="default-color" aria-label="默认放置配色">
-                    ${Object.values(FURNITURE_PALETTES).map((palette) => `<option value="${palette.id}">${palette.name}</option>`).join('')}
-                  </select>
+                  <label for="default-color">新家具配色</label>
+                  <div class="library-meta-actions">
+                    <select id="default-color" aria-label="新家具默认配色">
+                      ${Object.values(FURNITURE_PALETTES).map((palette) => `<option value="${palette.id}">${palette.name}</option>`).join('')}
+                    </select>
+                    <button id="apply-color" class="mini-button" type="button" title="把当前配色应用到全部已放置家具">应用全部</button>
+                  </div>
                 </div>
                 <div class="furniture-grid" id="furniture-grid"></div>
+                <button id="smart-layout" class="ghost-button full-width library-layout" type="button">重新自动布置全部家具</button>
               </section>
               <section class="tab-panel" data-panel="rooms">
+                <header class="panel-heading"><div><h2>房间</h2><p>选择房间，编辑名称与用途</p></div></header>
                 <div id="room-list" class="room-list"></div>
                 <div id="room-editor" class="room-editor"></div>
                 <button id="room-calibrate" class="ghost-button full-width" type="button">校准整体尺寸</button>
               </section>
               <section class="tab-panel" data-panel="projects">
+                <header class="panel-heading"><div><h2>我的方案</h2><p>自动保存当前进度，也可建立命名方案</p></div></header>
                 <div class="project-actions">
-                  <button id="project-save" class="primary-button full-width" type="button">保存当前方案</button>
-                  <button id="project-import" class="ghost-button full-width" type="button">导入 JSON</button>
+                  <button id="new-plan-button" class="primary-button" type="button">${icon('plus')}新建空白户型</button>
+                  <button id="project-import" class="ghost-button" type="button">导入 JSON</button>
                 </div>
                 <div id="project-list" class="project-list"></div>
               </section>
+              <section class="tab-panel" data-panel="scene">
+                <header class="panel-heading"><div><h2>场景设置</h2><p>调整观察方式，不影响户型数据</p></div><button id="scene-reset" class="mini-button" type="button">重置</button></header>
+                <div class="settings-group">
+                  <h3>空间</h3>
+                  <div class="control-grid">
+                    <label><span>墙高 <output id="ctrl-wall-height-out">2.8m</output></span>
+                      <input id="ctrl-wall-height" type="range" min="2.2" max="4" step="0.1" value="2.8" />
+                    </label>
+                    <label><span>灯光 <output id="ctrl-light-out">100%</output></span>
+                      <input id="ctrl-light" type="range" min="0.4" max="1.8" step="0.05" value="1" />
+                    </label>
+                    <label><span>旋转速度 <output id="ctrl-speed-out">0.6</output></span>
+                      <input id="ctrl-speed" type="range" min="0" max="2" step="0.1" value="0.6" />
+                    </label>
+                    <label>渲染画质
+                      <select id="ctrl-quality"><option value="high">高质量</option><option value="balanced">均衡</option></select>
+                    </label>
+                  </div>
+                </div>
+                <div class="settings-group">
+                  <h3>显示与编辑</h3>
+                  <div class="toggle-row">
+                    <label class="toggle"><input id="ctrl-rotate" type="checkbox" checked /><span>自动旋转</span></label>
+                    <label class="toggle"><input id="ctrl-grid" type="checkbox" checked /><span>地面网格</span></label>
+                    <label class="toggle"><input id="ctrl-labels" type="checkbox" checked /><span>房间标签</span></label>
+                    <label class="toggle"><input id="ctrl-dimensions" type="checkbox" /><span>尺寸标注</span></label>
+                    <label class="toggle"><input id="ctrl-snap" type="checkbox" checked /><span>网格吸附</span></label>
+                  </div>
+                </div>
+                <p class="settings-note">墙体模式与机位可直接在视图上方切换。拖拽视角后会暂停自动旋转，10 秒后继续。</p>
+              </section>
             </div>
-
-            <section class="scene-controls" aria-label="场景控制">
-              <header><strong>场景控制</strong><button id="scene-reset" class="mini-button" type="button">重置</button></header>
-              <div class="control-grid">
-                <label>墙体模式
-                  <select id="ctrl-wall-mode"><option value="low">降墙模式</option><option value="solid">实体墙</option><option value="ghost">半透明</option></select>
-                </label>
-                <label>机位
-                  <select id="ctrl-camera"><option value="iso">45° 沙盘</option><option value="top">正俯视</option><option value="front">正面斜视</option></select>
-                </label>
-                <label>墙高 <output id="ctrl-wall-height-out">2.8m</output>
-                  <input id="ctrl-wall-height" type="range" min="2.2" max="4" step="0.1" value="2.8" />
-                </label>
-                <label>灯光 <output id="ctrl-light-out">100%</output>
-                  <input id="ctrl-light" type="range" min="0.4" max="1.8" step="0.05" value="1" />
-                </label>
-                <label>旋转速度 <output id="ctrl-speed-out">0.6</output>
-                  <input id="ctrl-speed" type="range" min="0" max="2" step="0.1" value="0.6" />
-                </label>
-                <label>画质
-                  <select id="ctrl-quality"><option value="high">高质量</option><option value="balanced">均衡</option></select>
-                </label>
-              </div>
-              <div class="toggle-row">
-                <label class="toggle"><input id="ctrl-rotate" type="checkbox" checked /><span>自动旋转</span></label>
-                <label class="toggle"><input id="ctrl-grid" type="checkbox" checked /><span>网格</span></label>
-                <label class="toggle"><input id="ctrl-labels" type="checkbox" checked /><span>标签</span></label>
-                <label class="toggle"><input id="ctrl-dimensions" type="checkbox" /><span>尺寸</span></label>
-                <label class="toggle"><input id="ctrl-snap" type="checkbox" checked /><span>吸附</span></label>
-              </div>
-              <div class="scene-actions">
-                <button id="smart-layout" class="ghost-button" type="button">智能布置</button>
-                <button id="random-layout" class="ghost-button" type="button">随机配色</button>
-                <button id="screenshot-button" class="primary-button" type="button">导出截图</button>
-              </div>
-            </section>
           </aside>
         </main>
         <div id="toast-root" class="toast-root" aria-live="polite"></div>
@@ -313,19 +337,21 @@ export class App {
     this.query('#replay-button').addEventListener('click', () => this.showReplay());
     this.query('#upload-button').addEventListener('click', () => this.requestUpload());
     this.query('#config-button').addEventListener('click', () => this.showConfig());
-    this.query('#calibrate-button').addEventListener('click', () => this.showCalibration());
     this.query('#room-calibrate').addEventListener('click', () => this.showCalibration());
+    this.query('#status-scale').addEventListener('click', () => this.showCalibration());
     this.query('#save-button').addEventListener('click', () => this.showSave());
-    this.query('#project-save').addEventListener('click', () => this.showSave());
     this.query('#export-button').addEventListener('click', () => this.showExport());
     this.query('#about-button').addEventListener('click', () => this.showAbout());
+    this.query('#camera-reset').addEventListener('click', () => this.scene.resetCamera());
+    this.query('#cancel-placement').addEventListener('click', () => this.cancelPlacement());
     this.query('#new-plan-button').addEventListener('click', () => {
-      this.store.replace(emptyPlan('手动描绘户型'));
+      this.store.replace(emptyPlan('未命名户型'));
       this.currentProjectId = null;
       this.setPlanSourceLabel('空白户型');
       this.setViewMode('2d');
       this.setTool('wall');
-      this.toast('已创建空白户型，使用“画墙 / 房间”开始描绘', 'info');
+      this.renderProjects();
+      this.toast('已创建空白户型，拖拽即可画墙', 'info', { label: '撤销', action: () => this.restorePreviousPlan() });
     });
     this.query('#undo-button').addEventListener('click', () => this.store.undo());
     this.query('#redo-button').addEventListener('click', () => this.store.redo());
@@ -345,12 +371,23 @@ export class App {
       this.librarySearch = (event.target as HTMLInputElement).value;
       this.renderLibrary();
     });
-    this.query('#library-sort').addEventListener('change', (event) => {
-      this.librarySort = (event.target as HTMLSelectElement).value;
-      this.renderLibrary();
-    });
     this.query('#default-color').addEventListener('change', (event) => {
       this.defaultColor = (event.target as HTMLSelectElement).value as FurnitureColor;
+      this.ensureThumbnails(this.defaultColor);
+      this.renderLibrary();
+      if (this.placementModel) this.scene.setPlacement(this.placementModel, this.defaultColor);
+    });
+    this.query('#apply-color').addEventListener('click', () => {
+      const color = this.defaultColor;
+      const pending = this.store.plan.furniture.filter((item) => item.color !== color).length;
+      if (pending === 0) {
+        this.toast('全部家具已经是这个配色', 'success');
+        return;
+      }
+      this.store.mutate((plan) => {
+        for (const item of plan.furniture) item.color = color;
+      });
+      this.toast(`已把 ${pending} 件家具换成「${FURNITURE_PALETTES[color].name}」配色`, 'success');
     });
 
     this.bindSceneControls();
@@ -360,6 +397,7 @@ export class App {
       const sidebar = this.query('#sidebar');
       const open = sidebar.classList.toggle('drawer-open');
       this.query('#drawer-toggle').setAttribute('aria-expanded', String(open));
+      this.query('#drawer-toggle span').textContent = open ? '收起工作台' : '打开工作台';
     });
     this.query('#project-import').addEventListener('click', () => this.query<HTMLInputElement>('#json-input').click());
     this.query<HTMLInputElement>('#json-input').addEventListener('change', async (event) => {
@@ -370,7 +408,8 @@ export class App {
         this.store.replace(plan);
         this.currentProjectId = null;
         this.setPlanSourceLabel(plan.name);
-        this.toast('已导入户型 JSON', 'success');
+        this.renderProjects();
+        this.toast('已导入户型 JSON', 'success', { label: '撤销', action: () => this.restorePreviousPlan() });
       } catch (error) {
         this.toast(error instanceof Error ? error.message : 'JSON 导入失败', 'warning');
       }
@@ -429,16 +468,8 @@ export class App {
     });
     this.query('#smart-layout').addEventListener('click', () => {
       this.store.replace(smartLayout(this.store.plan, this.defaultColor));
-      this.toast('已按房间类型智能布置家具', 'success');
+      this.toast('已按房间用途重新布置，原有家具已替换', 'success', { label: '撤销', action: () => this.store.undo() });
     });
-    this.query('#random-layout').addEventListener('click', () => {
-      const colors = Object.keys(FURNITURE_PALETTES) as FurnitureColor[];
-      this.store.mutate((plan) => {
-        for (const item of plan.furniture) item.color = colors[Math.floor(Math.random() * colors.length)];
-      });
-      this.toast('已随机切换家具配色', 'success');
-    });
-    this.query('#screenshot-button').addEventListener('click', () => this.exportScreenshot());
   }
 
   private syncSceneControls() {
@@ -503,6 +534,11 @@ export class App {
         this.activeModal = null;
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        this.showSave();
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
         event.preventDefault();
         if (event.shiftKey) this.store.redo();
@@ -516,7 +552,10 @@ export class App {
       }
       if (event.key === 'Delete' || event.key === 'Backspace') {
         const id = this.store.selection.furnitureId;
-        if (id) this.deleteFurniture(id);
+        if (id) {
+          event.preventDefault();
+          this.deleteFurniture(id);
+        }
         return;
       }
       if (event.key.toLowerCase() === 'r') {
@@ -531,14 +570,18 @@ export class App {
   }
 
   private setViewMode(mode: ViewMode) {
+    const previous = this.viewMode;
     this.viewMode = mode;
     this.query('#viewport-stack').dataset.view = mode;
-    this.root.querySelectorAll<HTMLButtonElement>('button[data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === mode));
+    this.root.querySelectorAll<HTMLButtonElement>('button[data-view]').forEach((button) => {
+      const active = button.dataset.view === mode;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
     this.query('#editor-tools').classList.toggle('visible', mode !== '3d');
-    this.query('#hud-mode').textContent = mode === '2d' ? '2D 校正 · 滚轮缩放 / 右键平移' : mode === 'split' ? '分屏校正 · 修改实时同步' : '上帝斜俯视 · 拖拽旋转';
+    this.query('#hud-mode').textContent = mode === '2d' ? '滚轮缩放 · 右键平移 · Shift 正交' : mode === 'split' ? '左侧观察 · 右侧校正' : '拖拽旋转 · 滚轮缩放';
     if (mode === '2d') this.query('#hud-orbit').classList.add('hidden');
-    if (mode !== '3d') requestAnimationFrame(() => this.editor.fit());
-    if (mode !== '2d') requestAnimationFrame(() => this.scene.resetCamera());
+    if (mode !== '3d' && previous === '3d') requestAnimationFrame(() => this.editor.fit());
   }
 
   private updateOrbitHud(state: { phase: 'drag' | 'hold' | 'off'; seconds: number }) {
@@ -549,18 +592,26 @@ export class App {
     }
     chip.classList.remove('hidden');
     chip.textContent = state.phase === 'drag'
-      ? '手动视角 · 自动旋转已暂停'
-      : `视角已固定 · ${state.seconds}s 后从当前机位恢复自动旋转`;
+      ? '手动视角'
+      : `自动旋转已暂停 · ${state.seconds}s 后继续`;
   }
 
   private setTool(tool: EditorTool) {
     this.editor.setTool(tool);
-    this.root.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => button.classList.toggle('active', button.dataset.tool === tool));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => {
+      const active = button.dataset.tool === tool;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
     if (this.viewMode === '3d') this.setViewMode('split');
   }
 
   private setSidebarTab(tab: SidebarTab) {
-    this.root.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((button) => button.classList.toggle('active', button.dataset.tab === tab));
+    this.root.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((button) => {
+      const active = button.dataset.tab === tab;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+    });
     this.root.querySelectorAll<HTMLElement>('[data-panel]').forEach((panel) => panel.classList.toggle('active', panel.dataset.panel === tab));
     if (tab === 'projects') this.renderProjects();
     if (tab === 'rooms') this.renderRooms();
@@ -569,10 +620,18 @@ export class App {
   private renderStatus() {
     const plan = this.store.plan;
     this.query('#status-name').textContent = plan.name;
-    this.query('#status-area').textContent = `约 ${planArea(plan).toFixed(1)}㎡`;
-    const scaleText = plan.scaleSource === 'annotation' ? '标注尺寸' : plan.scaleSource === 'user-calibrated' ? '已校准' : '门宽估算';
-    this.query('#status-scale').textContent = `比例：${scaleText}`;
+    this.query('#status-area').textContent = `${planArea(plan).toFixed(1)} ㎡`;
+    const scaleText = plan.scaleSource === 'annotation' ? '标注尺寸' : plan.scaleSource === 'user-calibrated' ? '尺寸已校准' : '门宽估算 · 点击校准';
+    this.query('#status-scale').textContent = scaleText;
     this.query('#status-furniture').textContent = `${plan.furniture.length} 件家具`;
+    const wallHeight = this.query<HTMLInputElement>('#ctrl-wall-height');
+    if (document.activeElement !== wallHeight) wallHeight.value = String(plan.wallHeight);
+    this.query('#ctrl-wall-height-out').textContent = `${plan.wallHeight.toFixed(1)}m`;
+  }
+
+  private ensureThumbnails(color: FurnitureColor) {
+    const cached = this.thumbnailCache[color];
+    this.thumbnails = cached ?? (this.thumbnailCache[color] = generateThumbnails(color));
   }
 
   private renderLibrary() {
@@ -584,7 +643,7 @@ export class App {
       }
       return list;
     }, [])];
-    chips.innerHTML = categories.map((category) => `<button data-category="${category.id}" class="${this.libraryCategory === category.id ? 'active' : ''}" type="button">${category.name}</button>`).join('');
+    chips.innerHTML = categories.map((category) => `<button data-category="${category.id}" class="${this.libraryCategory === category.id ? 'active' : ''}" type="button" aria-pressed="${this.libraryCategory === category.id}">${category.name}</button>`).join('');
     chips.querySelectorAll<HTMLButtonElement>('[data-category]').forEach((button) => {
       button.addEventListener('click', () => {
         this.libraryCategory = button.dataset.category!;
@@ -597,26 +656,17 @@ export class App {
       const matchesSearch = !this.librarySearch || item.name.includes(this.librarySearch) || item.id.includes(this.librarySearch.toLowerCase());
       return matchesCategory && matchesSearch;
     });
-    if (this.librarySort === 'name') items = [...items].sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-    if (this.librarySort === 'area') items = [...items].sort((a, b) => b.dimensions.width * b.dimensions.depth - a.dimensions.width * a.dimensions.depth);
-
     const grid = this.query('#furniture-grid');
     grid.innerHTML = items.map((item) => `
-      <article class="furniture-card ${this.placementModel === item.id ? 'placing' : ''}" draggable="true" data-model="${item.id}" tabindex="0" role="button" aria-label="放置${item.name}">
-        <div class="furniture-thumb">${this.thumbnails[item.id] ? `<img src="${this.thumbnails[item.id]}" alt="${item.name} 缩略图" />` : '<span class="thumb-placeholder"></span>'}</div>
+      <button class="furniture-card ${this.placementModel === item.id ? 'placing' : ''}" draggable="true" data-model="${item.id}" type="button" aria-label="放置${item.name}" aria-pressed="${this.placementModel === item.id}">
+        <span class="furniture-thumb">${this.thumbnails[item.id] ? `<img src="${this.thumbnails[item.id]}" alt="" />` : '<span class="thumb-placeholder"></span>'}</span>
         <strong>${item.name}</strong>
         <small>${item.dimensions.width} × ${item.dimensions.depth} m</small>
-      </article>
-    `).join('') || '<p class="empty-note">没有匹配的家具</p>';
+      </button>
+    `).join('') || '<p class="empty-note">没有找到匹配的家具，试试其他关键词。</p>';
     grid.querySelectorAll<HTMLElement>('[data-model]').forEach((card) => {
       const model = card.dataset.model as FurnitureModelId;
       card.addEventListener('click', () => this.startPlacement(model));
-      card.addEventListener('keydown', (event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          this.startPlacement(model);
-        }
-      });
       card.addEventListener('dragstart', (event) => {
         event.dataTransfer?.setData('application/x-floorcube-model', model);
         if (event.dataTransfer) event.dataTransfer.effectAllowed = 'copy';
@@ -625,12 +675,19 @@ export class App {
   }
 
   private startPlacement(model: FurnitureModelId) {
+    if (this.placementModel === model) {
+      this.cancelPlacement();
+      return;
+    }
     this.placementModel = model;
-    this.scene.setPlacement(model);
+    this.scene.setPlacement(model, this.defaultColor);
+    this.query('#placement-name').textContent = `正在放置「${getFurnitureDefinition(model).name}」`;
     this.query('#hud-placement').classList.remove('hidden');
     this.renderLibrary();
+    this.query('#sidebar').classList.remove('drawer-open');
+    this.query('#drawer-toggle').setAttribute('aria-expanded', 'false');
+    this.query('#drawer-toggle span').textContent = '打开工作台';
     if (this.viewMode === '2d') this.setViewMode('split');
-    this.toast(`点击 3D 地面放置「${getFurnitureDefinition(model).name}」，Esc 退出`, 'info');
   }
 
   private cancelPlacement() {
@@ -676,21 +733,21 @@ export class App {
     panel.dataset.itemId = item.id;
     panel.classList.remove('hidden');
     panel.innerHTML = `
-      <header><strong>${definition.name}</strong><span>${item.id}</span></header>
-      <div class="inspector-grid">
-        <label>X / m<input id="fi-x" type="number" step="0.1" value="${item.position[0].toFixed(2)}" /></label>
-        <label>Z / m<input id="fi-z" type="number" step="0.1" value="${item.position[1].toFixed(2)}" /></label>
-        <label class="wide">旋转 <output id="fi-rotation-out">${Math.round((item.rotation * 180) / Math.PI)}°</output>
-          <input id="fi-rotation" type="range" min="-180" max="180" step="1" value="${Math.round((item.rotation * 180) / Math.PI)}" />
-        </label>
-      </div>
+      <header><div><strong>${definition.name}</strong><span>${definition.dimensions.width} × ${definition.dimensions.depth} m</span></div><button id="fi-close" class="icon-button" type="button" aria-label="取消选择">${icon('close')}</button></header>
+      <label class="rotation-control"><span>旋转角度 <output id="fi-rotation-out">${Math.round((item.rotation * 180) / Math.PI)}°</output></span>
+        <input id="fi-rotation" type="range" min="-180" max="180" step="1" value="${Math.round((item.rotation * 180) / Math.PI)}" />
+      </label>
       <div class="inspector-actions">
-        <button id="fi-rot-left" type="button">-90°</button>
+        <button id="fi-rot-left" type="button">−90°</button>
         <button id="fi-rot-right" type="button">+90°</button>
         <select id="fi-color" aria-label="家具配色">${Object.values(FURNITURE_PALETTES).map((palette) => `<option value="${palette.id}" ${palette.id === item.color ? 'selected' : ''}>${palette.name}</option>`).join('')}</select>
         <button id="fi-duplicate" type="button">复制</button>
-        <button id="fi-delete" class="danger" type="button">删除</button>
+        <button id="fi-delete" class="danger" type="button" aria-label="删除家具">${icon('close')}</button>
       </div>
+      <details class="position-details"><summary>精确坐标</summary><div class="inspector-grid">
+        <label>X / m<input id="fi-x" type="number" step="0.1" value="${item.position[0].toFixed(2)}" /></label>
+        <label>Z / m<input id="fi-z" type="number" step="0.1" value="${item.position[1].toFixed(2)}" /></label>
+      </div></details>
     `;
     const xInput = panel.querySelector<HTMLInputElement>('#fi-x')!;
     const zInput = panel.querySelector<HTMLInputElement>('#fi-z')!;
@@ -731,6 +788,7 @@ export class App {
     });
     panel.querySelector('#fi-duplicate')!.addEventListener('click', () => this.duplicateFurniture(item.id));
     panel.querySelector('#fi-delete')!.addEventListener('click', () => this.deleteFurniture(item.id));
+    panel.querySelector('#fi-close')!.addEventListener('click', () => this.store.select({}));
   }
 
   private rotateFurniture(id: string, delta: number) {
@@ -799,8 +857,8 @@ export class App {
     editor.innerHTML = `
       <label>房间名称<input id="room-name" type="text" value="${escapeHtml(room.name)}" maxlength="20" /></label>
       <label>房间类型<select id="room-type">${ROOM_TYPES.map((type) => `<option value="${type.id}" ${type.id === room.type ? 'selected' : ''}>${type.name}</option>`).join('')}</select></label>
-      <div class="room-stats"><span>面积 ${polygonArea(room.polygon).toFixed(2)}㎡</span><span>置信度 ${Math.round(room.confidence * 100)}%</span></div>
-      <button id="room-delete" class="ghost-button danger full-width" type="button">删除该房间</button>
+      <div class="room-stats"><span>面积 ${polygonArea(room.polygon).toFixed(2)}㎡</span><span>识别置信度 ${Math.round(room.confidence * 100)}%</span></div>
+      <button id="room-delete" class="ghost-button danger full-width" type="button">删除房间及其中家具</button>
     `;
     editor.querySelector<HTMLInputElement>('#room-name')!.addEventListener('change', (event) => {
       const value = (event.target as HTMLInputElement).value.trim() || '房间';
@@ -816,11 +874,12 @@ export class App {
       });
     });
     editor.querySelector('#room-delete')!.addEventListener('click', () => {
+      const furnitureCount = plan.furniture.filter((item) => item.roomId === room.id).length;
       this.store.mutate((draft) => {
         draft.rooms = draft.rooms.filter((candidate) => candidate.id !== room.id);
         draft.furniture = draft.furniture.filter((item) => item.roomId !== room.id);
       });
-      this.toast('已删除房间', 'info', { label: '撤销', action: () => this.store.undo() });
+      this.toast(`已删除房间${furnitureCount ? `及 ${furnitureCount} 件家具` : ''}`, 'info', { label: '撤销', action: () => this.store.undo() });
     });
   }
 
@@ -829,14 +888,13 @@ export class App {
     const list = this.query('#project-list');
     list.innerHTML = projects.map((project) => `
       <article class="project-card ${project.id === this.currentProjectId ? 'active' : ''}" data-project="${project.id}">
-        <div><strong>${escapeHtml(project.name)}</strong><small>${new Date(project.updatedAt).toLocaleString('zh-CN')} · ${project.plan.furniture.length} 件家具</small></div>
+        <button class="project-open" data-action="load" type="button"><span><strong>${escapeHtml(project.name)}</strong><small>${new Date(project.updatedAt).toLocaleDateString('zh-CN')} · ${project.plan.furniture.length} 件家具</small></span><em>${project.id === this.currentProjectId ? '当前方案' : '载入 →'}</em></button>
         <div class="project-card-actions">
-          <button data-action="load" type="button">载入</button>
           <button data-action="rename" type="button">重命名</button>
           <button data-action="delete" class="danger" type="button">删除</button>
         </div>
       </article>
-    `).join('') || '<p class="empty-note">还没有保存的方案。点击“保存当前方案”建立第一个项目。</p>';
+    `).join('') || '<div class="project-empty"><strong>还没有命名方案</strong><p>当前进度会自动保留。点击顶部“保存”，即可建立一个可反复载入的方案。</p></div>';
     list.querySelectorAll<HTMLElement>('[data-project]').forEach((card) => {
       const id = card.dataset.project!;
       card.querySelector('[data-action="load"]')!.addEventListener('click', () => this.loadProject(id));
@@ -851,7 +909,16 @@ export class App {
     this.setPlanSourceLabel(null);
     this.cancelPlacement();
     this.scene.resetCamera();
-    this.toast(`已载入示例「${DEMO_PLANS.find((demo) => demo.id === id)?.title}」`, 'success');
+    this.renderProjects();
+    this.toast(`已载入示例「${DEMO_PLANS.find((demo) => demo.id === id)?.title}」`, 'success', { label: '撤销', action: () => this.restorePreviousPlan() });
+  }
+
+  private restorePreviousPlan() {
+    this.store.undo();
+    this.currentProjectId = null;
+    this.setPlanSourceLabel(this.store.plan.name);
+    this.scene.resetCamera();
+    this.renderProjects();
   }
 
   private setPlanSourceLabel(label: string | null) {
@@ -874,8 +941,10 @@ export class App {
     this.store.replace(project.plan);
     this.currentProjectId = id;
     this.setPlanSourceLabel(project.name);
+    this.cancelPlacement();
+    this.scene.resetCamera();
     this.renderProjects();
-    this.toast(`已载入「${project.name}」`, 'success');
+    this.toast(`已载入「${project.name}」`, 'success', { label: '撤销', action: () => this.restorePreviousPlan() });
   }
 
   private renameProject(id: string) {
@@ -915,6 +984,13 @@ export class App {
 
   private showSave() {
     const suggested = this.store.plan.name || '我的户型方案';
+    const existing = loadProjects().find((project) => project.id === this.currentProjectId);
+    if (existing) {
+      upsertProject({ ...existing, updatedAt: Date.now(), plan: { ...this.store.plan, name: existing.name } });
+      this.renderProjects();
+      this.toast(`已更新「${existing.name}」`, 'success');
+      return;
+    }
     const modal = openModal('保存当前方案', `
       <p class="modal-note">方案仅保存在此浏览器本地，不会上传到任何服务器。</p>
       <label class="modal-field">方案名称<input id="save-name" type="text" value="${escapeHtml(suggested)}" maxlength="40" /></label>
@@ -1020,12 +1096,12 @@ export class App {
   private showConfig(afterSave?: () => void) {
     const config = this.config;
     const modal = openModal('模型接口配置', `
-      <p class="modal-note">FloorCube 不收集任何信息。接口地址、API Key 与模型名仅保存在你的浏览器本地，只用于调用你自己配置的模型接口。模型必须支持图像输入。</p>
+      <p class="modal-note">使用你自己的 OpenAI 兼容视觉接口。配置只保存在当前浏览器，FloorCube 不收集任何信息。</p>
       <label class="modal-field">接口地址 Base URL<input id="cfg-url" type="url" value="${escapeHtml(config?.baseUrl ?? DEFAULT_BASE_URL)}" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" /></label>
       <label class="modal-field">API Key<input id="cfg-key" type="password" value="${escapeHtml(config?.apiKey ?? '')}" placeholder="sk-…" autocomplete="off" /></label>
       <label class="modal-field">模型名称<input id="cfg-model" type="text" list="model-presets" value="${escapeHtml(config?.model ?? DEFAULT_MODEL)}" placeholder="qwen-vl-max" /></label>
       <datalist id="model-presets">${MODEL_PRESETS.map((preset) => `<option value="${preset.model}">${preset.label}</option>`).join('')}</datalist>
-      <p class="modal-hint">推荐路径：阿里云百炼 qwen-vl-max，或 DeepSeek 开放平台 deepseek-flash（选模型后地址自动匹配）。也可填写 OpenAI、Moonshot、Ollama 等任意 OpenAI 兼容接口，模型需支持图像输入。</p>
+      <details class="config-help"><summary>接口怎么填？</summary><p>模型必须支持图像输入。默认预填阿里云百炼与 qwen-vl-max；输入 deepseek 模型名时会自动匹配 DeepSeek 地址。也可使用 OpenAI、Moonshot、Ollama 等兼容接口。</p></details>
       <div id="cfg-result" class="config-result hidden"></div>
       <div class="modal-actions spread">
         <button id="cfg-clear" class="ghost-button danger" type="button">清除配置</button>
@@ -1113,40 +1189,30 @@ export class App {
 
   private openUploadModal(file?: File) {
     let imageDataUrl: string | null = null;
+    let cancelled = false;
     const modal = openModal('上传户型图', `
-      <div class="upload-zone" id="upload-zone" tabindex="0" role="button">
+      <p class="modal-note">选择一张清晰的户型图，识别后可以先在 2D 平面中校正，再布置家具。</p>
+      <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="选择户型图">
         <img id="upload-preview" class="hidden" alt="户型图预览" />
-        <div id="upload-placeholder"><strong>点击选择 / 拖拽 / 粘贴图片</strong><span>JPG / PNG / WebP · ≤10MB · 仅发送至你配置的模型接口</span></div>
-        <div class="scan-overlay hidden" id="scan-overlay" aria-hidden="true">
-          <div class="scan-grid"></div>
-          <div class="scan-beam"></div>
-          <span class="scan-corner tl"></span><span class="scan-corner tr"></span><span class="scan-corner bl"></span><span class="scan-corner br"></span>
-          <span class="scan-badge"><i></i>AI SCANNING</span>
-        </div>
+        <div id="upload-placeholder"><strong>点击选择，或将图片拖到这里</strong><span>也支持直接粘贴 · JPG / PNG / WebP · 不超过 10MB</span><small>图片仅发送至你配置的模型接口</small></div>
+        <div class="scan-overlay hidden" id="scan-overlay" aria-hidden="true"><div class="scan-beam"></div><span class="scan-badge"><i></i>正在识别</span></div>
       </div>
       <div class="recognition-progress hidden" id="recognition-progress" role="status" aria-live="polite">
         <div class="scan-status">
-          <svg class="cube-loader" viewBox="0 0 64 64" aria-hidden="true">
-            <path class="face-top" d="M32 4 58 18 32 32 6 18Z" />
-            <path class="face-left" d="M32 32v28L6 46V18Z" />
-            <path class="face-right" d="M32 32v28l26-14V18Z" />
-          </svg>
-          <div class="scan-copy">
-            <strong>AI 正在后台分析，页面没有卡住</strong>
-            <span id="scan-hint">正在定位墙体轮廓…</span>
-          </div>
+          <span class="loading-spinner" aria-hidden="true"></span>
+          <div class="scan-copy"><strong>正在分析户型图</strong><span id="scan-hint">正在定位墙体轮廓…</span></div>
           <span class="scan-timer" id="scan-timer">00:00</span>
         </div>
         <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
-        <ol><li data-stage="upload">读取图片</li><li data-stage="recognize">AI 识别墙体门窗</li><li data-stage="generate">生成结构化户型</li><li data-stage="done">完成</li></ol>
-        <p class="scan-note">推理型模型（如 DeepSeek）通常需要 1–3 分钟，期间请保持窗口打开；图片仅发送至你配置的模型接口。</p>
+        <ol><li data-stage="upload">读取图片</li><li data-stage="recognize">识别墙体门窗</li><li data-stage="generate">生成户型</li><li data-stage="done">完成</li></ol>
+        <p class="scan-note">推理型模型通常需要 1–3 分钟，请保持窗口打开。</p>
       </div>
       <div id="upload-error" class="config-result error hidden"></div>
       <div class="modal-actions spread">
-        <button id="upload-manual" class="ghost-button" type="button">手动描绘兜底</button>
-        <div><button id="upload-demo" class="ghost-button" type="button">先用示例</button><button id="upload-recognize" class="primary-button" type="button" disabled>开始 AI 识别</button></div>
+        <button id="upload-manual" class="ghost-button" type="button">不使用 AI，手动绘制</button>
+        <button id="upload-recognize" class="primary-button" type="button" disabled>开始识别</button>
       </div>
-    `, { wide: true, onClose: () => { fileInput.removeEventListener('change', onFileChange); stopLoading(); } });
+    `, { wide: true, onClose: () => { cancelled = true; fileInput.removeEventListener('change', onFileChange); stopLoading(); } });
     this.activeModal = modal;
     const zone = modal.element.querySelector<HTMLElement>('#upload-zone')!;
     const preview = modal.element.querySelector<HTMLImageElement>('#upload-preview')!;
@@ -1158,7 +1224,6 @@ export class App {
     const scanOverlay = modal.element.querySelector('#scan-overlay')!;
     const scanHint = modal.element.querySelector('#scan-hint')!;
     const scanTimer = modal.element.querySelector('#scan-timer')!;
-    const demoButton = modal.element.querySelector<HTMLButtonElement>('#upload-demo')!;
     const manualButton = modal.element.querySelector<HTMLButtonElement>('#upload-manual')!;
 
     const loadingHints = [
@@ -1241,15 +1306,16 @@ export class App {
       if (!imageDataUrl || !this.config) return;
       recognizeButton.disabled = true;
       recognizeButton.classList.add('busy');
-      recognizeButton.textContent = 'AI 识别中…';
-      demoButton.disabled = true;
+      recognizeButton.textContent = '正在识别…';
       manualButton.disabled = true;
       errorBox.classList.add('hidden');
       progress.classList.remove('hidden');
       setStage('upload');
       startLoading();
       try {
-        const plan = await recognizeFloorPlan(this.config, imageDataUrl, setStage);
+        const recognizedPlan = await recognizeFloorPlan(this.config, imageDataUrl, setStage);
+        if (cancelled) return;
+        const { plan, adjusted, unplaced } = constrainFurnitureLayout(recognizedPlan);
         stopLoading();
         this.store.replace(plan);
         this.currentProjectId = null;
@@ -1257,8 +1323,13 @@ export class App {
         modal.close();
         this.setViewMode('split');
         this.scene.resetCamera();
-        this.toast('识别完成，可在 2D 视图校正低置信度区域', 'success');
+        const notes = [
+          adjusted > 0 ? `已校正 ${adjusted} 件家具的位置或朝向` : '',
+          unplaced > 0 ? `${unplaced} 件家具没有安全位置，未自动放置` : '',
+        ].filter(Boolean).join('；');
+        this.toast(notes ? `识别完成；${notes}` : '识别完成，可在 2D 视图校正低置信度区域', unplaced > 0 ? 'warning' : 'success');
       } catch (error) {
+        if (cancelled) return;
         stopLoading();
         progress.classList.add('hidden');
         errorBox.classList.remove('hidden');
@@ -1279,19 +1350,17 @@ export class App {
         recognizeButton.classList.remove('busy');
         recognizeButton.disabled = false;
         recognizeButton.textContent = '重试识别';
-        demoButton.disabled = false;
         manualButton.disabled = false;
       }
     });
     modal.element.querySelector('#upload-manual')!.addEventListener('click', () => {
       modal.close();
+      this.store.replace(emptyPlan('未命名户型'));
+      this.currentProjectId = null;
+      this.setPlanSourceLabel('空白户型');
       this.setViewMode('2d');
       this.setTool('wall');
-      this.toast('已切换到 2D 手动描绘，无需 API Key', 'info');
-    });
-    modal.element.querySelector('#upload-demo')!.addEventListener('click', () => {
-      modal.close();
-      this.loadDemo('two-bed');
+      this.toast('已创建空白户型，拖拽即可画墙', 'info', { label: '撤销', action: () => this.restorePreviousPlan() });
     });
   }
 
@@ -1356,21 +1425,17 @@ export class App {
   }
 
   private showOnboarding() {
-    const modal = openModal('欢迎使用户型魔方', `
+    const modal = openModal('把户型，摆成立体的家', `
+      <p class="onboarding-lead">无需注册。先从示例开始，或上传自己的户型图。</p>
       <div class="onboarding-steps">
-        <article><span>1</span><strong>看示例</strong><p>打开即有带家具的 3D 户型，拖拽旋转、滚轮缩放，无需任何配置。</p></article>
-        <article><span>2</span><strong>试摆放</strong><p>从右侧家具库点击或拖拽家具到地面，移动、旋转、换色，实时检查尺寸。</p></article>
-        <article><span>3</span><strong>识别你的图纸</strong><p>上传户型图前配置你自己的模型接口；也可以直接用 2D 工具手动描绘。</p></article>
+        <article><span>01</span><strong>转一转</strong><p>拖拽旋转沙盘，滚轮缩放，直观看看每个房间。</p></article>
+        <article><span>02</span><strong>摆一摆</strong><p>从家具库选择家具，点击地面放置，再移动、旋转或换色。</p></article>
+        <article><span>03</span><strong>换成自己的家</strong><p>上传图纸并使用自己的模型接口识别，也可以直接手动绘制。</p></article>
       </div>
-      <div class="modal-actions"><button id="onboard-skip" class="ghost-button" type="button">跳过</button><button id="onboard-start" class="primary-button" type="button">开始体验</button></div>
-    `, { wide: true });
+      <div class="onboarding-footer"><span>图纸与配置仅由你的浏览器和自配接口处理</span><button id="onboard-start" class="primary-button" type="button">开始体验</button></div>
+    `, { wide: true, onClose: () => markOnboarded() });
     this.activeModal = modal;
-    const done = () => {
-      markOnboarded();
-      modal.close();
-    };
-    modal.element.querySelector('#onboard-skip')!.addEventListener('click', done);
-    modal.element.querySelector('#onboard-start')!.addEventListener('click', done);
+    modal.element.querySelector('#onboard-start')!.addEventListener('click', modal.close);
   }
 
   private toast(message: string, kind: 'info' | 'success' | 'warning' = 'info', action?: { label: string; action: () => void }) {
