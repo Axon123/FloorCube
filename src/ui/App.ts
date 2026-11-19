@@ -101,6 +101,7 @@ export class App {
       onFurnitureDragEnd: () => this.store.endTransaction(),
       onPlace: (model, position, roomId) => this.placeFurniture(model, position, roomId),
       onFeedback: (message, kind) => this.toast(message, kind),
+      onOrbitHold: (state) => this.updateOrbitHud(state),
     });
     this.editor = new PlanEditor(this.query('#editor-container'), this.store, {
       onSelectRoom: (id) => this.store.select({ roomId: id ?? undefined }),
@@ -181,6 +182,7 @@ export class App {
               <div class="viewport-hud">
                 <span class="hud-chip" id="hud-mode">上帝斜俯视 · 拖拽旋转</span>
                 <span class="hud-chip hud-placement hidden" id="hud-placement">点击地面放置家具 · Esc 退出</span>
+                <span class="hud-chip hud-orbit hidden" id="hud-orbit"></span>
               </div>
               <div class="drop-overlay hidden" id="drop-overlay"><strong>松开以上传户型图</strong><span>JPG / PNG / WebP · ≤10MB</span></div>
               <div class="furniture-inspector hidden" id="furniture-inspector"></div>
@@ -329,7 +331,7 @@ export class App {
     this.query('#redo-button').addEventListener('click', () => this.store.redo());
     this.query('#fit-2d').addEventListener('click', () => this.editor.fit());
 
-    this.root.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((button) => {
+    this.root.querySelectorAll<HTMLButtonElement>('button[data-view]').forEach((button) => {
       button.addEventListener('click', () => this.setViewMode(button.dataset.view as ViewMode));
     });
     this.root.querySelectorAll<HTMLButtonElement>('[data-tool]').forEach((button) => {
@@ -531,11 +533,24 @@ export class App {
   private setViewMode(mode: ViewMode) {
     this.viewMode = mode;
     this.query('#viewport-stack').dataset.view = mode;
-    this.root.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === mode));
+    this.root.querySelectorAll<HTMLButtonElement>('button[data-view]').forEach((button) => button.classList.toggle('active', button.dataset.view === mode));
     this.query('#editor-tools').classList.toggle('visible', mode !== '3d');
     this.query('#hud-mode').textContent = mode === '2d' ? '2D 校正 · 滚轮缩放 / 右键平移' : mode === 'split' ? '分屏校正 · 修改实时同步' : '上帝斜俯视 · 拖拽旋转';
+    if (mode === '2d') this.query('#hud-orbit').classList.add('hidden');
     if (mode !== '3d') requestAnimationFrame(() => this.editor.fit());
     if (mode !== '2d') requestAnimationFrame(() => this.scene.resetCamera());
+  }
+
+  private updateOrbitHud(state: { phase: 'drag' | 'hold' | 'off'; seconds: number }) {
+    const chip = this.query('#hud-orbit');
+    if (state.phase === 'off' || this.viewMode === '2d') {
+      chip.classList.add('hidden');
+      return;
+    }
+    chip.classList.remove('hidden');
+    chip.textContent = state.phase === 'drag'
+      ? '手动视角 · 自动旋转已暂停'
+      : `视角已固定 · ${state.seconds}s 后从当前机位恢复自动旋转`;
   }
 
   private setTool(tool: EditorTool) {
@@ -1102,17 +1117,36 @@ export class App {
       <div class="upload-zone" id="upload-zone" tabindex="0" role="button">
         <img id="upload-preview" class="hidden" alt="户型图预览" />
         <div id="upload-placeholder"><strong>点击选择 / 拖拽 / 粘贴图片</strong><span>JPG / PNG / WebP · ≤10MB · 仅发送至你配置的模型接口</span></div>
+        <div class="scan-overlay hidden" id="scan-overlay" aria-hidden="true">
+          <div class="scan-grid"></div>
+          <div class="scan-beam"></div>
+          <span class="scan-corner tl"></span><span class="scan-corner tr"></span><span class="scan-corner bl"></span><span class="scan-corner br"></span>
+          <span class="scan-badge"><i></i>AI SCANNING</span>
+        </div>
       </div>
-      <div class="recognition-progress hidden" id="recognition-progress">
+      <div class="recognition-progress hidden" id="recognition-progress" role="status" aria-live="polite">
+        <div class="scan-status">
+          <svg class="cube-loader" viewBox="0 0 64 64" aria-hidden="true">
+            <path class="face-top" d="M32 4 58 18 32 32 6 18Z" />
+            <path class="face-left" d="M32 32v28L6 46V18Z" />
+            <path class="face-right" d="M32 32v28l26-14V18Z" />
+          </svg>
+          <div class="scan-copy">
+            <strong>AI 正在后台分析，页面没有卡住</strong>
+            <span id="scan-hint">正在定位墙体轮廓…</span>
+          </div>
+          <span class="scan-timer" id="scan-timer">00:00</span>
+        </div>
         <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
         <ol><li data-stage="upload">读取图片</li><li data-stage="recognize">AI 识别墙体门窗</li><li data-stage="generate">生成结构化户型</li><li data-stage="done">完成</li></ol>
+        <p class="scan-note">推理型模型（如 DeepSeek）通常需要 1–3 分钟，期间请保持窗口打开；图片仅发送至你配置的模型接口。</p>
       </div>
       <div id="upload-error" class="config-result error hidden"></div>
       <div class="modal-actions spread">
         <button id="upload-manual" class="ghost-button" type="button">手动描绘兜底</button>
         <div><button id="upload-demo" class="ghost-button" type="button">先用示例</button><button id="upload-recognize" class="primary-button" type="button" disabled>开始 AI 识别</button></div>
       </div>
-    `, { wide: true, onClose: () => fileInput.removeEventListener('change', onFileChange) });
+    `, { wide: true, onClose: () => { fileInput.removeEventListener('change', onFileChange); stopLoading(); } });
     this.activeModal = modal;
     const zone = modal.element.querySelector<HTMLElement>('#upload-zone')!;
     const preview = modal.element.querySelector<HTMLImageElement>('#upload-preview')!;
@@ -1121,8 +1155,46 @@ export class App {
     const errorBox = modal.element.querySelector('#upload-error')!;
     const progress = modal.element.querySelector('#recognition-progress')!;
     const progressBar = modal.element.querySelector<HTMLElement>('#progress-bar')!;
+    const scanOverlay = modal.element.querySelector('#scan-overlay')!;
+    const scanHint = modal.element.querySelector('#scan-hint')!;
+    const scanTimer = modal.element.querySelector('#scan-timer')!;
+    const demoButton = modal.element.querySelector<HTMLButtonElement>('#upload-demo')!;
+    const manualButton = modal.element.querySelector<HTMLButtonElement>('#upload-manual')!;
+
+    const loadingHints = [
+      '正在定位墙体轮廓…',
+      '正在区分门、窗与开口…',
+      '正在估算房间尺寸与面积…',
+      '推理型模型会先思考再作答，耗时更长属正常现象',
+      '识别完成后将自动生成 3D 沙盘…',
+    ];
+    let loadingTimers: number[] = [];
+    const stopLoading = () => {
+      loadingTimers.forEach((timer) => clearInterval(timer));
+      loadingTimers = [];
+      zone.classList.remove('scanning');
+      scanOverlay.classList.add('hidden');
+    };
+    const startLoading = () => {
+      const startedAt = Date.now();
+      let hintIndex = 0;
+      scanHint.textContent = loadingHints[0];
+      scanTimer.textContent = '00:00';
+      zone.classList.add('scanning');
+      scanOverlay.classList.remove('hidden');
+      loadingTimers.push(window.setInterval(() => {
+        const seconds = Math.floor((Date.now() - startedAt) / 1000);
+        scanTimer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+      }, 1000));
+      loadingTimers.push(window.setInterval(() => {
+        hintIndex = (hintIndex + 1) % loadingHints.length;
+        scanHint.textContent = loadingHints[hintIndex];
+        scanHint.animate([{ opacity: 0.2 }, { opacity: 1 }], { duration: 350 });
+      }, 4500));
+    };
 
     const setFile = async (nextFile: File) => {
+      if (zone.classList.contains('scanning')) return;
       const error = validateImageFile(nextFile);
       if (error) {
         errorBox.classList.remove('hidden');
@@ -1138,9 +1210,11 @@ export class App {
     };
     if (file) void setFile(file);
 
-    zone.addEventListener('click', () => this.query<HTMLInputElement>('#file-input').click());
+    zone.addEventListener('click', () => {
+      if (!zone.classList.contains('scanning')) this.query<HTMLInputElement>('#file-input').click();
+    });
     zone.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') this.query<HTMLInputElement>('#file-input').click();
+      if (event.key === 'Enter' && !zone.classList.contains('scanning')) this.query<HTMLInputElement>('#file-input').click();
     });
     zone.addEventListener('dragover', (event) => event.preventDefault());
     zone.addEventListener('drop', (event) => {
@@ -1166,11 +1240,17 @@ export class App {
     recognizeButton.addEventListener('click', async () => {
       if (!imageDataUrl || !this.config) return;
       recognizeButton.disabled = true;
+      recognizeButton.classList.add('busy');
+      recognizeButton.textContent = 'AI 识别中…';
+      demoButton.disabled = true;
+      manualButton.disabled = true;
       errorBox.classList.add('hidden');
       progress.classList.remove('hidden');
       setStage('upload');
+      startLoading();
       try {
         const plan = await recognizeFloorPlan(this.config, imageDataUrl, setStage);
+        stopLoading();
         this.store.replace(plan);
         this.currentProjectId = null;
         this.setPlanSourceLabel('AI 识别方案');
@@ -1179,6 +1259,7 @@ export class App {
         this.scene.resetCamera();
         this.toast('识别完成，可在 2D 视图校正低置信度区域', 'success');
       } catch (error) {
+        stopLoading();
         progress.classList.add('hidden');
         errorBox.classList.remove('hidden');
         errorBox.innerHTML = '';
@@ -1195,8 +1276,11 @@ export class App {
           details.append(summary, pre);
           errorBox.appendChild(details);
         }
+        recognizeButton.classList.remove('busy');
         recognizeButton.disabled = false;
         recognizeButton.textContent = '重试识别';
+        demoButton.disabled = false;
+        manualButton.disabled = false;
       }
     });
     modal.element.querySelector('#upload-manual')!.addEventListener('click', () => {

@@ -72,7 +72,10 @@ export interface SceneCallbacks {
   onFurnitureDragEnd: (id: string, valid: boolean) => void;
   onPlace: (model: FurnitureModelId, position: Vec2, roomId?: string) => void;
   onFeedback: (message: string, kind?: 'info' | 'success' | 'warning') => void;
+  onOrbitHold?: (state: { phase: 'drag' | 'hold' | 'off'; seconds: number }) => void;
 }
+
+const ORBIT_HOLD_MS = 10_000;
 
 interface DragState {
   id: string;
@@ -124,6 +127,10 @@ export class FloorScene {
   private resizeObserver: ResizeObserver;
   private clock = performance.now();
   private disposed = false;
+  private orbitHeld = false;
+  private lastOrbitEnd = -Infinity;
+  private rotateRamp = 0;
+  private lastHoldKey = '';
 
   constructor(private container: HTMLElement, private store: PlanStore, private callbacks: SceneCallbacks) {
     this.renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
@@ -149,6 +156,8 @@ export class FloorScene {
     this.controls.minPolarAngle = 0.08;
     this.controls.maxPolarAngle = 1.34;
     this.controls.autoRotateSpeed = this.settings.rotateSpeed;
+    this.controls.addEventListener('start', this.onOrbitStart);
+    this.controls.addEventListener('end', this.onOrbitEnd);
 
     this.scene.add(new HemisphereLight(0xfff1d8, 0x536058, 1.35));
     this.keyLight = new DirectionalLight(0xffd8a2, 2.6);
@@ -226,13 +235,36 @@ export class FloorScene {
   private animate = () => {
     if (this.disposed) return;
     const now = performance.now();
-    const delta = Math.min((now - this.clock) / 1000, 0.05);
+    const rawDelta = (now - this.clock) / 1000;
+    const delta = Math.min(rawDelta, 0.05);
     this.clock = now;
-    this.controls.autoRotate = this.settings.autoRotate && !this.drag && !this.placementModel;
-    this.controls.update();
+    const idleMs = now - this.lastOrbitEnd;
+    const ambient = this.settings.autoRotate && !this.drag && !this.placementModel && !this.orbitHeld && idleMs > ORBIT_HOLD_MS;
+    this.rotateRamp = ambient ? Math.min(1, this.rotateRamp + delta / 2) : 0;
+    this.controls.autoRotate = this.rotateRamp > 0;
+    this.controls.autoRotateSpeed = this.settings.rotateSpeed * this.rotateRamp;
+    // 阻尼按帧衰减会导致低帧率设备惯性拖尾数倍变长，换算成按时间衰减保持手感一致
+    this.controls.dampingFactor = Math.min(0.9, Math.max(0.02, 1 - Math.pow(1 - 0.075, rawDelta * 60)));
+    this.controls.update(delta);
     this.particles.rotation.y += delta * 0.018;
     this.renderer.render(this.scene, this.camera);
     this.labelRenderer.render(this.scene, this.camera);
+    const phase = !this.settings.autoRotate ? 'off' : this.orbitHeld ? 'drag' : idleMs <= ORBIT_HOLD_MS ? 'hold' : 'off';
+    const seconds = phase === 'hold' ? Math.max(1, Math.ceil((ORBIT_HOLD_MS - idleMs) / 1000)) : 0;
+    const holdKey = `${phase}:${seconds}`;
+    if (holdKey !== this.lastHoldKey) {
+      this.lastHoldKey = holdKey;
+      this.callbacks.onOrbitHold?.({ phase, seconds });
+    }
+  };
+
+  private onOrbitStart = () => {
+    this.orbitHeld = true;
+  };
+
+  private onOrbitEnd = () => {
+    this.orbitHeld = false;
+    this.lastOrbitEnd = performance.now();
   };
 
   private world(point: Vec2, y = 0) {
@@ -432,6 +464,7 @@ export class FloorScene {
 
   updateSettings(settings: SceneSettings) {
     const structural = settings.wallMode !== this.settings.wallMode || settings.showLabels !== this.settings.showLabels || settings.showDimensions !== this.settings.showDimensions;
+    if (settings.autoRotate && !this.settings.autoRotate) this.lastOrbitEnd = -Infinity;
     this.settings = { ...settings };
     this.controls.autoRotateSpeed = settings.rotateSpeed;
     this.keyLight.intensity = 2.6 * settings.lightIntensity;
@@ -529,6 +562,7 @@ export class FloorScene {
   focusRoom(id: string) {
     const room = this.store.plan.rooms.find((candidate) => candidate.id === id);
     if (!room) return;
+    this.lastOrbitEnd = performance.now();
     const centroid = polygonCentroid(room.polygon);
     const target = this.world(centroid, 0.5);
     this.controls.target.copy(target);
@@ -539,6 +573,8 @@ export class FloorScene {
   }
 
   cameraPreset(preset: 'iso' | 'top' | 'front') {
+    this.orbitHeld = false;
+    this.lastOrbitEnd = -Infinity;
     const bounds = planBounds(allPlanPoints(this.store.plan));
     const maxDim = Math.max(bounds.width, bounds.depth, 4);
     const aspectFactor = Math.max(1, 1 / Math.max(this.camera.aspect, 0.35));
@@ -694,6 +730,8 @@ export class FloorScene {
     this.renderer.domElement.removeEventListener('pointermove', this.onPointerMove);
     this.renderer.domElement.removeEventListener('pointerup', this.onPointerUp);
     this.renderer.domElement.removeEventListener('pointerleave', this.onPointerLeave);
+    this.controls.removeEventListener('start', this.onOrbitStart);
+    this.controls.removeEventListener('end', this.onOrbitEnd);
     this.controls.dispose();
     disposeObject(this.scene);
     this.renderer.dispose();
