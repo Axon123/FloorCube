@@ -107,6 +107,14 @@
   - screenshots/2026-11-19-真实识别-分屏校正.png
   - screenshots/2026-11-19-模型配置弹窗.png（刷新，含 DeepSeek 预设说明）
 
+### 2026-11-19 · 推送 GitHub：网络拦截下的 Git Data API 推送
+
+- 用户确认后提交并推送至 https://github.com/Axon123/FloorCube （main）。
+- 提交内容：完整源码 49 文件（src / scripts / 配置 / README 重写），并按交付物清单随仓库附带《AI使用过程记录.md》与 screenshots/ 九张过程截图；提交前扫描确认仓库不含任何 API Key（e2e 脚本仅从环境变量读取）。
+- 网络障碍与对策：本机网络对 github.com:443 连接层拦截（curl 超时、git push 报 HTTP2 framing / Empty reply），api.github.com 可达；SSH 密钥未登记 GitHub 不可用。改走 GitHub Git Data API：逐文件 base64 blob → tree（base_tree 保留远端历史）→ commit → 更新 ref，完成等价推送；校验远端 tree 与本地 HEAD tree 完全一致（a2f5025）。
+- 历史对齐：API 创建的 commit 与本地 commit 因作者时区字节差异 SHA 不同；用「显式 author/committer 字段镜像本地 commit（SHA 逐字节复现 a882bc0）+ 合并提交快进 main」的方式统一两条历史，全程未使用 force push。远端 main 为合并提交（本地 commit 是其父之一），本地 main 为其祖先，网络恢复后 git pull --ff-only 即可完全对齐。
+- 经验：git 直连不可用时，Git Data API 可完成完整推送；镜像本地 commit 需显式传 author/committer 的 name/email/date（含时区偏移），消息保留结尾换行，才能逐字节复现 SHA。
+
 ---
 
 ## 待办提醒
