@@ -129,7 +129,7 @@ export class FloorScene {
   private rotateRamp = 0;
   private lastHoldKey = '';
 
-  constructor(private container: HTMLElement, private store: PlanStore, private callbacks: SceneCallbacks) {
+  constructor(private container: HTMLElement, private store: PlanStore, private callbacks: SceneCallbacks, private readOnly = false) {
     this.renderer = new WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -270,7 +270,8 @@ export class FloorScene {
     return this.settings.snapEnabled ? [snap(point[0]), snap(point[1])] : point;
   }
 
-  rebuild() {
+  rebuild(preserveView = false) {
+    const previousCenter = this.center;
     const plan = this.store.plan;
     disposeObject(this.planGroup);
     disposeObject(this.furnitureGroup);
@@ -284,6 +285,12 @@ export class FloorScene {
 
     const bounds = planBounds(allPlanPoints(plan));
     this.center = [bounds.minX + bounds.width / 2, bounds.minY + bounds.depth / 2];
+    if (preserveView) {
+      const shift = new Vector3(previousCenter[0] - this.center[0], 0, previousCenter[1] - this.center[1]);
+      this.camera.position.add(shift);
+      this.controls.target.add(shift);
+      this.controls.update();
+    }
     const maxDim = Math.max(bounds.width, bounds.depth, 4);
 
     const base = new Mesh(new RoundedBoxGeometry(bounds.width + 1.5, 0.22, bounds.depth + 1.5, 3, 0.12), material(0xd9cbb2, { roughness: 0.92 }));
@@ -319,7 +326,14 @@ export class FloorScene {
         const element = document.createElement('div');
         element.className = 'room-label';
         const area = polygonArea(room.polygon).toFixed(1);
-        element.innerHTML = `<strong>${room.name}</strong>${this.settings.showDimensions ? `<span>${area}㎡</span>` : ''}`;
+        const name = document.createElement('strong');
+        name.textContent = room.name;
+        element.appendChild(name);
+        if (this.settings.showDimensions) {
+          const dimensions = document.createElement('span');
+          dimensions.textContent = `${area}㎡`;
+          element.appendChild(dimensions);
+        }
         const label = new CSS2DObject(element);
         const centroid = polygonCentroid(room.polygon);
         label.position.copy(this.world(centroid, 0.05));
@@ -467,6 +481,7 @@ export class FloorScene {
         if (child instanceof Mesh) {
           const source = child.material as MeshStandardMaterial;
           const cloned = source.clone();
+          cloned.userData.shared = false;
           cloned.transparent = true;
           cloned.opacity = 0.55;
           cloned.depthWrite = false;
@@ -613,6 +628,7 @@ export class FloorScene {
   }
 
   private onPointerDown = (event: PointerEvent) => {
+    if (this.readOnly) return;
     this.downPoint.set(event.clientX, event.clientY);
     if (this.placementModel || event.button !== 0) return;
     const furnitureId = this.furnitureHit(event);

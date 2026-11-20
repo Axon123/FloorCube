@@ -63,6 +63,12 @@ const WALL_FRONT_CLEARANCE: Partial<Record<FurnitureModelId, number>> = {
   bookshelf: 0.3,
   'tv-console': 0.3,
   fridge: 0.4,
+  dresser: 0.4,
+  'dressing-table': 0.4,
+  'sectional-sofa': 0.4,
+  sideboard: 0.35,
+  'shoe-cabinet': 0.4,
+  'washing-machine': 0.5,
 };
 
 function angleDistance(a: number, b: number) {

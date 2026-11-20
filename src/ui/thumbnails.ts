@@ -4,7 +4,7 @@ import type { FurnitureColor } from '../models/types';
 
 export function generateThumbnails(color: FurnitureColor = 'walnut'): Record<string, string> {
   const renderer = new WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
-  renderer.setSize(132, 96);
+  renderer.setSize(264, 192);
   renderer.setPixelRatio(1);
   renderer.outputColorSpace = 'srgb';
   const scene = new Scene();

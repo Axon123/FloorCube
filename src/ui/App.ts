@@ -1,10 +1,10 @@
-import { DEFAULT_BASE_URL, DEFAULT_MODEL, DEEPSEEK_BASE_URL, MODEL_PRESETS, RecognitionError, fileToDataUrl, recognizeFloorPlan, testConnection, validateImageFile } from '../ai/client';
-import type { RecognitionStage } from '../ai/client';
+import { BASE_URL_PRESETS, DEFAULT_BASE_URL, DEFAULT_MODEL, MODEL_PRESETS, RecognitionError, fileToDataUrl, getRecognitionSettings, getRequestModel, recognizeFloorPlan, testConnection, validateImageFile } from '../ai/client';
+import type { RecognitionMode, RecognitionProgress } from '../ai/client';
 import { polygonArea } from '../core/geometry';
 import { constrainFurnitureLayout, smartLayout } from '../core/layout';
 import { validateFurniture } from '../core/placement';
 import { emptyPlan, normalizeFloorPlan, planArea, roomTypeName, scalePlan, uid, wallLength, ROOM_TYPES } from '../core/schema';
-import type { ModelConfig, RoomType } from '../core/schema';
+import type { FloorPlan, ModelConfig, RoomType } from '../core/schema';
 import { PlanStore } from '../core/store';
 import { clearConfig, deleteProject, isOnboarded, loadAutosave, loadConfig, loadProjects, markOnboarded, saveAutosave, saveConfig, upsertProject } from '../core/storage';
 import type { SavedProject } from '../core/storage';
@@ -64,7 +64,7 @@ interface ModalHandle {
   element: HTMLElement;
 }
 
-function openModal(title: string, body: string, options: { wide?: boolean; onClose?: () => void } = {}): ModalHandle {
+function openModal(title: string, body: string, options: { wide?: boolean; closeOnBackdrop?: boolean; onClose?: () => void } = {}): ModalHandle {
   const root = document.querySelector<HTMLElement>('#modal-root')!;
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -82,7 +82,7 @@ function openModal(title: string, body: string, options: { wide?: boolean; onClo
   };
   overlay.querySelector('.modal-close')!.addEventListener('click', close);
   overlay.addEventListener('pointerdown', (event) => {
-    if (event.target === overlay) close();
+    if (event.target === overlay && options.closeOnBackdrop !== false) close();
   });
   requestAnimationFrame(() => overlay.classList.add('visible'));
   return { close, element: overlay };
@@ -104,7 +104,10 @@ export class App {
   private librarySearch = '';
   private autosaveTimer = 0;
   private activeModal: ModalHandle | null = null;
+  private configModal: (ModalHandle & { afterSave?: () => void }) | null = null;
+  private uploadModal: (ModalHandle & { setFile: (file: File) => Promise<void> }) | null = null;
   private pendingUploadFile: File | null = null;
+  private recognitionMode: RecognitionMode = 'fast';
 
   constructor(private root: HTMLElement) {
     const autosave = loadAutosave();
@@ -658,7 +661,7 @@ export class App {
     });
     const grid = this.query('#furniture-grid');
     grid.innerHTML = items.map((item) => `
-      <button class="furniture-card ${this.placementModel === item.id ? 'placing' : ''}" draggable="true" data-model="${item.id}" type="button" aria-label="放置${item.name}" aria-pressed="${this.placementModel === item.id}">
+      <button class="furniture-card ${this.placementModel === item.id ? 'placing' : ''}" draggable="true" data-model="${item.id}" type="button" aria-label="放置${item.name}" title="${item.description}" aria-pressed="${this.placementModel === item.id}">
         <span class="furniture-thumb">${this.thumbnails[item.id] ? `<img src="${this.thumbnails[item.id]}" alt="" />` : '<span class="thumb-placeholder"></span>'}</span>
         <strong>${item.name}</strong>
         <small>${item.dimensions.width} × ${item.dimensions.depth} m</small>
@@ -1094,74 +1097,130 @@ export class App {
   }
 
   private showConfig(afterSave?: () => void) {
+    if (this.configModal) {
+      if (afterSave) this.configModal.afterSave = afterSave;
+      return;
+    }
     const config = this.config;
+    const initialBaseUrl = config?.baseUrl ?? DEFAULT_BASE_URL;
+    const initialModel = config?.model ?? DEFAULT_MODEL;
+    const customUrl = !BASE_URL_PRESETS.some((preset) => preset.baseUrl === initialBaseUrl);
+    const customModel = !MODEL_PRESETS.some((preset) => preset.model === initialModel);
     const modal = openModal('模型接口配置', `
       <p class="modal-note">使用你自己的 OpenAI 兼容视觉接口。配置只保存在当前浏览器，FloorCube 不收集任何信息。</p>
-      <label class="modal-field">接口地址 Base URL<input id="cfg-url" type="url" value="${escapeHtml(config?.baseUrl ?? DEFAULT_BASE_URL)}" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" /></label>
+      <label class="modal-field">模型<select id="cfg-model-preset">
+        ${MODEL_PRESETS.map((preset) => `<option value="${preset.model}">${preset.label}</option>`).join('')}
+        <option value="custom">用户自定义</option>
+      </select></label>
+      <label class="modal-field hidden" id="cfg-model-custom">自定义模型名称<input id="cfg-model" type="text" value="${escapeHtml(customModel ? initialModel : '')}" placeholder="填写服务商提供的模型名称" /></label>
+      <label class="modal-field">接口服务商<select id="cfg-provider" aria-describedby="cfg-url-preset">
+        ${BASE_URL_PRESETS.map((preset) => `<option value="${preset.baseUrl}">${preset.label}</option>`).join('')}
+        <option value="custom">用户自定义</option>
+      </select></label>
+      <p class="scan-note" id="cfg-url-preset"></p>
+      <label class="modal-field hidden" id="cfg-url-custom">自定义接口地址 Base URL<input id="cfg-url" type="url" value="${escapeHtml(customUrl ? initialBaseUrl : '')}" placeholder="填写 OpenAI 兼容接口的 Base URL" /></label>
+      <p class="scan-note" id="cfg-model-request" role="status"></p>
       <label class="modal-field">API Key<input id="cfg-key" type="password" value="${escapeHtml(config?.apiKey ?? '')}" placeholder="sk-…" autocomplete="off" /></label>
-      <label class="modal-field">模型名称<input id="cfg-model" type="text" list="model-presets" value="${escapeHtml(config?.model ?? DEFAULT_MODEL)}" placeholder="qwen-vl-max" /></label>
-      <datalist id="model-presets">${MODEL_PRESETS.map((preset) => `<option value="${preset.model}">${preset.label}</option>`).join('')}</datalist>
-      <details class="config-help"><summary>接口怎么填？</summary><p>模型必须支持图像输入。默认预填阿里云百炼与 qwen-vl-max；输入 deepseek 模型名时会自动匹配 DeepSeek 地址。也可使用 OpenAI、Moonshot、Ollama 等兼容接口。</p></details>
+      <details class="config-help"><summary>接口怎么填？</summary><p>默认使用 DeepSeek Flash 与 DeepSeek 官方接口。API Key 必须来自所选服务商，模型须支持图像输入。DeepSeek Flash 预设在百炼接口下请求 deepseek-v4.1-flash，支持快速关闭思考、精细开启思考。地域可用性以百炼控制台为准；业务空间专属地址或其他模型可通过“用户自定义”填写。</p></details>
       <div id="cfg-result" class="config-result hidden"></div>
       <div class="modal-actions spread">
         <button id="cfg-clear" class="ghost-button danger" type="button">清除配置</button>
         <div><button id="cfg-test" class="ghost-button" type="button">测试连接</button><button id="cfg-save" class="primary-button" type="button">保存配置</button></div>
       </div>
-    `, { wide: true });
+    `, {
+      wide: true,
+      onClose: () => {
+        this.configModal = null;
+        if (this.activeModal === modal) this.activeModal = null;
+      },
+    });
     this.activeModal = modal;
+    this.configModal = { ...modal, afterSave };
     const url = modal.element.querySelector<HTMLInputElement>('#cfg-url')!;
     const key = modal.element.querySelector<HTMLInputElement>('#cfg-key')!;
     const model = modal.element.querySelector<HTMLInputElement>('#cfg-model')!;
+    const provider = modal.element.querySelector<HTMLSelectElement>('#cfg-provider')!;
+    const modelPreset = modal.element.querySelector<HTMLSelectElement>('#cfg-model-preset')!;
     const result = modal.element.querySelector('#cfg-result')!;
-    const readConfig = (): ModelConfig => ({ baseUrl: url.value.trim(), apiKey: key.value.trim(), model: model.value.trim() });
-    const syncBaseUrl = () => {
-      const name = model.value.trim().toLowerCase();
-      const current = url.value.trim();
-      if (name.includes('deepseek') && (current === DEFAULT_BASE_URL || current === '')) url.value = DEEPSEEK_BASE_URL;
-      else if (name.includes('qwen') && current === DEEPSEEK_BASE_URL) url.value = DEFAULT_BASE_URL;
+    provider.value = customUrl ? 'custom' : initialBaseUrl;
+    modelPreset.value = customModel ? 'custom' : initialModel;
+    const syncPresetFields = () => {
+      const isCustomUrl = provider.value === 'custom';
+      const isCustomModel = modelPreset.value === 'custom';
+      modal.element.querySelector('#cfg-url-custom')!.classList.toggle('hidden', !isCustomUrl);
+      modal.element.querySelector('#cfg-model-custom')!.classList.toggle('hidden', !isCustomModel);
+      url.disabled = !isCustomUrl;
+      model.disabled = !isCustomModel;
+      const urlPreview = modal.element.querySelector('#cfg-url-preset')!;
+      urlPreview.classList.toggle('hidden', isCustomUrl);
+      urlPreview.textContent = isCustomUrl ? '' : `Base URL：${provider.value}`;
+      const modelPreview = modal.element.querySelector('#cfg-model-request')!;
+      try {
+        const requestModel = getRequestModel({
+          baseUrl: isCustomUrl ? url.value.trim() : provider.value,
+          model: isCustomModel ? model.value.trim() : modelPreset.value,
+        });
+        modelPreview.textContent = requestModel ? `请求模型：${requestModel}` : '请填写模型名称。';
+      } catch {
+        modelPreview.textContent = '填写有效的接口地址后显示实际请求模型。';
+      }
+      result.classList.add('hidden');
     };
-    model.addEventListener('input', syncBaseUrl);
-    model.addEventListener('change', syncBaseUrl);
+    provider.addEventListener('change', syncPresetFields);
+    modelPreset.addEventListener('change', syncPresetFields);
+    url.addEventListener('input', syncPresetFields);
+    model.addEventListener('input', syncPresetFields);
+    syncPresetFields();
     const showResult = (ok: boolean, message: string) => {
       result.classList.remove('hidden', 'ok', 'error');
       result.classList.add(ok ? 'ok' : 'error');
       result.textContent = message;
     };
+    const readConfig = (): ModelConfig | null => {
+      const candidate = {
+        baseUrl: provider.value === 'custom' ? url.value.trim() : provider.value,
+        apiKey: key.value.trim(),
+        model: modelPreset.value === 'custom' ? model.value.trim() : modelPreset.value,
+      };
+      try {
+        const parsed = new URL(candidate.baseUrl);
+        if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
+      } catch {
+        showResult(false, '接口地址必须是有效的 http(s) URL。');
+        return null;
+      }
+      if (!candidate.apiKey || !candidate.model) {
+        showResult(false, 'API Key 与模型名不能为空。');
+        return null;
+      }
+      return candidate;
+    };
     modal.element.querySelector('#cfg-test')!.addEventListener('click', async () => {
       const candidate = readConfig();
-      if (!candidate.baseUrl || !candidate.apiKey || !candidate.model) {
-        showResult(false, '请先填写完整配置。');
-        return;
-      }
+      if (!candidate) return;
       showResult(true, '正在测试连接与图像能力…');
       const response = await testConnection(candidate);
       showResult(response.ok, response.message);
     });
     modal.element.querySelector('#cfg-save')!.addEventListener('click', () => {
       const candidate = readConfig();
-      try {
-        const parsed = new URL(candidate.baseUrl);
-        if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error();
-      } catch {
-        showResult(false, '接口地址必须是有效的 http(s) URL。');
-        return;
-      }
-      if (!candidate.apiKey || !candidate.model) {
-        showResult(false, 'API Key 与模型名不能为空。');
-        return;
-      }
+      if (!candidate) return;
       saveConfig(candidate);
       this.config = candidate;
+      const onSave = this.configModal?.afterSave;
       modal.close();
       this.toast('模型配置已保存到浏览器本地', 'success');
-      afterSave?.();
+      onSave?.();
     });
     modal.element.querySelector('#cfg-clear')!.addEventListener('click', () => {
       clearConfig();
       this.config = null;
-      url.value = DEFAULT_BASE_URL;
+      provider.value = DEFAULT_BASE_URL;
+      modelPreset.value = DEFAULT_MODEL;
+      url.value = '';
       key.value = '';
-      model.value = DEFAULT_MODEL;
+      model.value = '';
+      syncPresetFields();
       showResult(true, '已清除本地配置。');
     });
   }
@@ -1188,98 +1247,292 @@ export class App {
   }
 
   private openUploadModal(file?: File) {
+    if (this.uploadModal) {
+      if (file) void this.uploadModal.setFile(file);
+      return;
+    }
     let imageDataUrl: string | null = null;
-    let cancelled = false;
+    let closed = false;
+    let fileVersion = 0;
+    let controller: AbortController | null = null;
+    let partialPlan: FloorPlan | null = null;
+    let completedPlan: FloorPlan | null = null;
+    let previewScene: FloorScene | null = null;
+    let previewStore: PlanStore | null = null;
+    let previewMode: '2d' | '3d' = '3d';
+    let previewSignature = '';
+    let previewTimer = 0;
+    let timer = 0;
+    let startedAt = 0;
+    let lastContentAt = 0;
+    let receivedChars = 0;
+    let requestMode = this.recognitionMode;
+    let lastProgress: RecognitionProgress | null = null;
+    const milestones = new Set<string>();
     const modal = openModal('上传户型图', `
-      <p class="modal-note">选择一张清晰的户型图，识别后可以先在 2D 平面中校正，再布置家具。</p>
-      <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="选择户型图">
-        <img id="upload-preview" class="hidden" alt="户型图预览" />
-        <div id="upload-placeholder"><strong>点击选择，或将图片拖到这里</strong><span>也支持直接粘贴 · JPG / PNG / WebP · 不超过 10MB</span><small>图片仅发送至你配置的模型接口</small></div>
-        <div class="scan-overlay hidden" id="scan-overlay" aria-hidden="true"><div class="scan-beam"></div><span class="scan-badge"><i></i>正在识别</span></div>
-      </div>
-      <div class="recognition-progress hidden" id="recognition-progress" role="status" aria-live="polite">
-        <div class="scan-status">
-          <span class="loading-spinner" aria-hidden="true"></span>
-          <div class="scan-copy"><strong>正在分析户型图</strong><span id="scan-hint">正在定位墙体轮廓…</span></div>
-          <span class="scan-timer" id="scan-timer">00:00</span>
+      <p class="modal-note">边识别，边查看户型。此窗口会一直保留，完成后点击「应用到工作区」才会替换当前方案。</p>
+      <fieldset class="recognition-mode-options" id="recognition-mode-options" aria-describedby="recognition-mode-hint">
+        <legend>识别模式 <span>切换仅对下次识别生效</span></legend>
+        <label><input type="radio" name="recognition-mode" value="fast" ${this.recognitionMode === 'fast' ? 'checked' : ''} /><span><strong>快速</strong><small>优先速度 · 适合清晰图纸</small></span></label>
+        <label><input type="radio" name="recognition-mode" value="detailed" ${this.recognitionMode === 'detailed' ? 'checked' : ''} /><span><strong>精细</strong><small>仔细核对 · 适合复杂户型</small></span></label>
+      </fieldset>
+      <p class="scan-note" id="recognition-mode-hint" role="status"></p>
+      <div class="recognition-workspace" id="recognition-workspace">
+        <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="选择户型图">
+          <img id="upload-preview" class="hidden" alt="待识别户型图" />
+          <div id="upload-placeholder"><strong>点击选择，或将图片拖到这里</strong><span>也支持直接粘贴 · JPG / PNG / WebP · 不超过 10MB</span><small>大图会先缩放以减少传输量</small></div>
         </div>
-        <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
-        <ol><li data-stage="upload">读取图片</li><li data-stage="recognize">识别墙体门窗</li><li data-stage="generate">生成户型</li><li data-stage="done">完成</li></ol>
-        <p class="scan-note">推理型模型通常需要 1–3 分钟，请保持窗口打开。</p>
+        <section class="recognition-preview hidden" id="recognition-preview" aria-label="逐步识别预览">
+          <header><strong id="recognition-preview-title">实时预览 · 未校验</strong><div class="recognition-view-switch" aria-label="预览视图"><button id="recognition-fit" type="button" aria-label="适配预览全景">全景</button><button type="button" data-preview-view="2d" aria-pressed="false">2D</button><button type="button" data-preview-view="3d" aria-pressed="true">3D</button></div></header>
+          <div class="recognition-preview-body">
+            <p id="recognition-empty">收到第一面完整墙体后，会在这里逐步搭建户型。</p>
+            <img id="recognition-plan-image" class="hidden" alt="已识别的墙体、房间、门窗和家具" />
+            <div id="recognition-scene" class="scene-container hidden" aria-label="实时三维户型预览"></div>
+          </div>
+          <p class="scan-note" id="recognition-preview-note">仅显示已完整返回的对象，缺失部分会随输出补充。</p>
+        </section>
       </div>
-      <div id="upload-error" class="config-result error hidden"></div>
-      <div class="modal-actions spread">
+      <p class="modal-hint" id="upload-image-info" role="status"></p>
+      <div class="recognition-progress hidden" id="recognition-progress">
+        <div class="scan-status">
+          <span class="loading-spinner" id="recognition-spinner" aria-hidden="true"></span>
+          <div class="scan-copy" role="status" aria-live="polite"><strong id="scan-title">正在连接模型</strong><span id="scan-hint">等待接口返回首段识别结果</span></div>
+          <span class="scan-timer" id="scan-timer" aria-label="已用时间">00:00</span>
+        </div>
+        <div class="progress-track recognition-activity" aria-hidden="true"><div class="progress-bar"></div></div>
+        <ol id="recognition-stages"><li>图片就绪</li><li>等待返回</li><li>实时搭建</li><li>校验应用</li></ol>
+        <div class="recognition-counts" id="recognition-counts"><span><b data-count="walls">0</b> 面墙</span><span><b data-count="rooms">0</b> 个房间</span><span><b data-count="openings">0</b> 处门窗</span><span><b data-count="furniture">0</b> 件家具</span></div>
+        <p class="scan-note" id="recognition-transfer">已接收 0 字符 · 不估算完成百分比</p>
+        <details class="recognition-log"><summary>识别记录</summary><ul id="recognition-events"></ul></details>
+      </div>
+      <div id="upload-error" class="config-result error hidden" role="alert"></div>
+      <div class="modal-actions spread" id="upload-actions">
         <button id="upload-manual" class="ghost-button" type="button">不使用 AI，手动绘制</button>
-        <button id="upload-recognize" class="primary-button" type="button" disabled>开始识别</button>
+        <div><button id="upload-apply" class="primary-button hidden" type="button">应用到工作区</button><button id="upload-partial" class="ghost-button hidden" type="button">使用已识别部分</button><button id="upload-cancel" class="ghost-button hidden" type="button">停止识别</button><button id="upload-recognize" class="primary-button" type="button" disabled>开始识别</button></div>
       </div>
-    `, { wide: true, onClose: () => { cancelled = true; fileInput.removeEventListener('change', onFileChange); stopLoading(); } });
+    `, { wide: true, closeOnBackdrop: false, onClose: () => {
+      closed = true;
+      this.uploadModal = null;
+      if (this.activeModal === modal) this.activeModal = null;
+      fileVersion += 1;
+      controller?.abort();
+      clearInterval(timer);
+      clearTimeout(previewTimer);
+      previewScene?.dispose();
+      fileInput.removeEventListener('change', onFileChange);
+    } });
     this.activeModal = modal;
-    const zone = modal.element.querySelector<HTMLElement>('#upload-zone')!;
-    const preview = modal.element.querySelector<HTMLImageElement>('#upload-preview')!;
-    const placeholder = modal.element.querySelector('#upload-placeholder')!;
-    const recognizeButton = modal.element.querySelector<HTMLButtonElement>('#upload-recognize')!;
-    const errorBox = modal.element.querySelector('#upload-error')!;
-    const progress = modal.element.querySelector('#recognition-progress')!;
-    const progressBar = modal.element.querySelector<HTMLElement>('#progress-bar')!;
-    const scanOverlay = modal.element.querySelector('#scan-overlay')!;
-    const scanHint = modal.element.querySelector('#scan-hint')!;
-    const scanTimer = modal.element.querySelector('#scan-timer')!;
-    const manualButton = modal.element.querySelector<HTMLButtonElement>('#upload-manual')!;
-
-    const loadingHints = [
-      '正在定位墙体轮廓…',
-      '正在区分门、窗与开口…',
-      '正在估算房间尺寸与面积…',
-      '推理型模型会先思考再作答，耗时更长属正常现象',
-      '识别完成后将自动生成 3D 沙盘…',
-    ];
-    let loadingTimers: number[] = [];
+    const query = <T extends Element = HTMLElement>(selector: string) => modal.element.querySelector<T>(selector)!;
+    const modeOptions = query<HTMLFieldSetElement>('#recognition-mode-options');
+    const updateModeHint = () => {
+      if (this.config) query('#recognition-mode-hint').textContent = getRecognitionSettings(this.config, this.recognitionMode).note;
+    };
+    modeOptions.addEventListener('change', () => {
+      if (controller) return;
+      this.recognitionMode = query<HTMLInputElement>('input[name="recognition-mode"]:checked').value as RecognitionMode;
+      updateModeHint();
+    });
+    updateModeHint();
+    const zone = query('#upload-zone');
+    const preview = query<HTMLImageElement>('#upload-preview');
+    const placeholder = query('#upload-placeholder');
+    const recognizeButton = query<HTMLButtonElement>('#upload-recognize');
+    const manualButton = query<HTMLButtonElement>('#upload-manual');
+    const cancelButton = query<HTMLButtonElement>('#upload-cancel');
+    const partialButton = query<HTMLButtonElement>('#upload-partial');
+    const applyButton = query<HTMLButtonElement>('#upload-apply');
+    const errorBox = query('#upload-error');
+    const progress = query('#recognition-progress');
+    const scanTitle = query('#scan-title');
+    const scanHint = query('#scan-hint');
+    const scanTimer = query('#scan-timer');
+    const imageInfo = query('#upload-image-info');
+    const previewPanel = query('#recognition-preview');
+    const sceneContainer = query('#recognition-scene');
+    const planImage = query<HTMLImageElement>('#recognition-plan-image');
+    const previewEmpty = query('#recognition-empty');
+    const events = query('#recognition-events');
+    const elapsed = () => Math.floor((Date.now() - startedAt) / 1000);
+    const log = (key: string, message: string) => {
+      if (milestones.has(key)) return;
+      milestones.add(key);
+      const entry = document.createElement('li');
+      entry.textContent = `${elapsed()}s · ${message}`;
+      events.appendChild(entry);
+    };
+    const setStage = (stage: number) => {
+      query('#recognition-stages').querySelectorAll('li').forEach((item, index) => {
+        item.classList.toggle('active', index <= stage);
+        if (index === stage) item.setAttribute('aria-current', 'step');
+        else item.removeAttribute('aria-current');
+      });
+    };
+    const resetPreview = () => {
+      clearTimeout(previewTimer);
+      previewTimer = 0;
+      partialPlan = null;
+      completedPlan = null;
+      previewSignature = '';
+      applyButton.classList.add('hidden');
+      recognizeButton.classList.replace('ghost-button', 'primary-button');
+      query('#recognition-preview-title').textContent = '实时预览 · 未校验';
+      previewScene?.dispose();
+      previewScene = null;
+      previewStore = null;
+      sceneContainer.classList.add('hidden');
+      planImage.classList.add('hidden');
+      planImage.removeAttribute('src');
+      previewEmpty.classList.remove('hidden');
+      partialButton.classList.add('hidden');
+      query('#recognition-preview-note').textContent = '仅显示已完整返回的对象，缺失部分会随输出补充。';
+      progress.querySelectorAll('[data-count]').forEach((element) => { element.textContent = '0'; });
+    };
+    const renderPreview = () => {
+      if (!partialPlan || closed) return;
+      previewEmpty.classList.add('hidden');
+      planImage.classList.toggle('hidden', previewMode !== '2d');
+      sceneContainer.classList.toggle('hidden', previewMode !== '3d');
+      if (previewMode !== '3d') return;
+      if (!previewScene) {
+        previewStore = new PlanStore(partialPlan);
+        try {
+          previewScene = new FloorScene(sceneContainer, previewStore, {
+            onSelectFurniture: () => {}, onSelectRoom: () => {}, onFurnitureTransform: () => {},
+            onFurnitureDragStart: () => {}, onFurnitureDragEnd: () => {}, onPlace: () => {}, onFeedback: () => {},
+          }, true);
+          previewScene.updateSettings({ ...DEFAULT_SCENE_SETTINGS, autoRotate: false, showLabels: false, showGrid: false, quality: 'balanced' });
+        } catch {
+          sceneContainer.replaceChildren();
+          previewMode = '2d';
+          query<HTMLButtonElement>('[data-preview-view="3d"]').disabled = true;
+          query('#recognition-preview-note').textContent = '当前设备无法创建额外 3D 预览，已切换到实时 2D 预览。';
+          updatePreviewMode();
+          return;
+        }
+      } else {
+        previewStore!.replace(partialPlan, false);
+        previewScene.rebuild(true);
+      }
+    };
+    const updatePreviewMode = () => {
+      modal.element.querySelectorAll<HTMLButtonElement>('[data-preview-view]').forEach((button) => {
+        button.setAttribute('aria-pressed', String(button.dataset.previewView === previewMode));
+      });
+      renderPreview();
+    };
+    modal.element.querySelectorAll<HTMLButtonElement>('[data-preview-view]').forEach((button) => {
+      button.addEventListener('click', () => {
+        previewMode = button.dataset.previewView as '2d' | '3d';
+        updatePreviewMode();
+      });
+    });
+    query('#recognition-fit').addEventListener('click', () => { previewScene?.resetCamera(); });
+    const updateHint = () => {
+      if (!lastProgress) return;
+      const idle = Math.floor((Date.now() - lastContentAt) / 1000);
+      if (lastProgress.phase === 'validating') {
+        scanTitle.textContent = '输出已接收，正在校验户型';
+        scanHint.textContent = '检查结构、门窗引用与家具摆放位置';
+      } else if (lastProgress.buffered) {
+        scanTitle.textContent = '接口采用整包返回';
+        scanHint.textContent = '该接口没有返回流式数据，完整结果到达后才能显示';
+      } else if (receivedChars === 0) {
+        scanTitle.textContent = '等待模型返回识别结果';
+        scanHint.textContent = '模型尚未输出户型数据，可能正在排队或推理；可以随时停止';
+      } else {
+        scanTitle.textContent = '正在接收并搭建户型';
+        scanHint.textContent = idle >= 15
+          ? `已有 ${idle} 秒未收到新的户型数据，正在等待模型继续输出`
+          : partialPlan ? '新返回的完整对象会自动加入预览' : '正在接收第一段结构数据，完整对象返回后即显示';
+      }
+      query('#recognition-transfer').textContent = `${requestMode === 'fast' ? '快速' : '精细'}模式 · 已接收 ${receivedChars.toLocaleString()} 字符 · ${lastProgress.transport === 'proxy' ? '经转发接口' : '直连接口'} · ${lastProgress.buffered ? '非流式' : '流式请求'}`;
+    };
+    const onProgress = (event: RecognitionProgress) => {
+      if (closed || !controller || controller.signal.aborted) return;
+      lastProgress = event;
+      if (event.receivedChars > receivedChars) lastContentAt = Date.now();
+      receivedChars = event.receivedChars;
+      setStage(event.phase === 'validating' ? 3 : receivedChars > 0 ? 2 : 1);
+      if (event.transport === 'proxy') log('proxy', '直连不可用，已切换转发接口');
+      if (receivedChars > 0) log('first-content', '收到第一段户型数据');
+      if (event.partial) {
+        const signature = JSON.stringify(event.partial);
+        if (signature !== previewSignature) {
+          previewSignature = signature;
+          partialPlan = event.partial;
+          planImage.src = planToDataUrl(partialPlan, 560);
+          const labels = { walls: '墙体', rooms: '房间', openings: '门窗', furniture: '家具' } as const;
+          for (const key of ['walls', 'rooms', 'openings', 'furniture'] as const) {
+            const count = partialPlan[key].length;
+            query(`[data-count="${key}"]`).textContent = String(count);
+            if (count > 0) log(key, `已显示首批${labels[key]}`);
+          }
+          if (!previewTimer) {
+            previewTimer = window.setTimeout(() => {
+              previewTimer = 0;
+              renderPreview();
+            }, 250);
+          }
+        }
+      }
+      if (event.phase === 'validating') log('validating', '模型输出结束，正在校验完整结果');
+      updateHint();
+    };
     const stopLoading = () => {
-      loadingTimers.forEach((timer) => clearInterval(timer));
-      loadingTimers = [];
+      clearInterval(timer);
       zone.classList.remove('scanning');
-      scanOverlay.classList.add('hidden');
+      zone.setAttribute('aria-disabled', 'false');
+      progress.classList.remove('running');
+      query('#recognition-spinner').classList.add('hidden');
+      cancelButton.classList.add('hidden');
+      recognizeButton.classList.remove('hidden', 'busy');
+      recognizeButton.disabled = !imageDataUrl;
+      manualButton.disabled = false;
     };
-    const startLoading = () => {
-      const startedAt = Date.now();
-      let hintIndex = 0;
-      scanHint.textContent = loadingHints[0];
-      scanTimer.textContent = '00:00';
-      zone.classList.add('scanning');
-      scanOverlay.classList.remove('hidden');
-      loadingTimers.push(window.setInterval(() => {
-        const seconds = Math.floor((Date.now() - startedAt) / 1000);
-        scanTimer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
-      }, 1000));
-      loadingTimers.push(window.setInterval(() => {
-        hintIndex = (hintIndex + 1) % loadingHints.length;
-        scanHint.textContent = loadingHints[hintIndex];
-        scanHint.animate([{ opacity: 0.2 }, { opacity: 1 }], { duration: 350 });
-      }, 4500));
-    };
-
     const setFile = async (nextFile: File) => {
-      if (zone.classList.contains('scanning')) return;
+      if (controller) return;
       const error = validateImageFile(nextFile);
       if (error) {
         errorBox.classList.remove('hidden');
         errorBox.textContent = error;
         return;
       }
-      imageDataUrl = await fileToDataUrl(nextFile);
-      preview.src = imageDataUrl;
-      preview.classList.remove('hidden');
-      placeholder.classList.add('hidden');
-      recognizeButton.disabled = false;
+      const version = ++fileVersion;
+      imageDataUrl = null;
+      recognizeButton.disabled = true;
+      imageInfo.textContent = '正在读取并优化图片…';
       errorBox.classList.add('hidden');
+      resetPreview();
+      previewPanel.classList.add('hidden');
+      progress.classList.add('hidden');
+      query('#recognition-workspace').classList.remove('recognizing');
+      try {
+        const prepared = await fileToDataUrl(nextFile);
+        if (closed || version !== fileVersion) return;
+        imageDataUrl = prepared;
+        preview.src = prepared;
+        preview.classList.remove('hidden');
+        placeholder.classList.add('hidden');
+        const bytes = Math.ceil((prepared.length - prepared.indexOf(',') - 1) * 3 / 4);
+        const reduction = Math.max(0, Math.round((1 - bytes / nextFile.size) * 100));
+        imageInfo.textContent = `图片就绪 · 发送约 ${Math.ceil(bytes / 1024)} KB${reduction > 0 ? `，体积减少 ${reduction}%` : ''} · 图片仅用于你配置的模型接口识别`;
+        recognizeButton.textContent = '开始识别';
+        recognizeButton.disabled = false;
+      } catch (error) {
+        if (closed || version !== fileVersion) return;
+        imageInfo.textContent = '图片准备失败';
+        errorBox.textContent = error instanceof Error ? error.message : '图片读取失败，请换一张图片。';
+        errorBox.classList.remove('hidden');
+      }
     };
-    if (file) void setFile(file);
-
     zone.addEventListener('click', () => {
-      if (!zone.classList.contains('scanning')) this.query<HTMLInputElement>('#file-input').click();
+      if (!controller) this.query<HTMLInputElement>('#file-input').click();
     });
     zone.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' && !zone.classList.contains('scanning')) this.query<HTMLInputElement>('#file-input').click();
+      if ((event.key === 'Enter' || event.key === ' ') && !controller) {
+        event.preventDefault();
+        this.query<HTMLInputElement>('#file-input').click();
+      }
     });
     zone.addEventListener('dragover', (event) => event.preventDefault());
     zone.addEventListener('drop', (event) => {
@@ -1294,66 +1547,116 @@ export class App {
       if (selected) void setFile(selected);
     };
     fileInput.addEventListener('change', onFileChange);
-
-    const stageOrder: RecognitionStage[] = ['upload', 'recognize', 'generate', 'done'];
-    const setStage = (stage: RecognitionStage) => {
-      const index = stageOrder.indexOf(stage);
-      progressBar.style.width = `${((index + 1) / stageOrder.length) * 100}%`;
-      progress.querySelectorAll('li').forEach((item, itemIndex) => item.classList.toggle('active', itemIndex <= index));
+    const canUsePartial = () => Boolean(partialPlan?.walls.length && partialPlan.rooms.length);
+    const applyPlan = (recognizedPlan: FloorPlan, incomplete = false) => {
+      const { plan, adjusted, unplaced } = constrainFurnitureLayout(recognizedPlan);
+      stopLoading();
+      this.store.replace(plan);
+      this.currentProjectId = null;
+      this.setPlanSourceLabel(incomplete ? 'AI 部分识别 · 待校正' : 'AI 识别方案');
+      modal.close();
+      this.setViewMode('split');
+      this.scene.resetCamera();
+      const notes = [
+        adjusted > 0 ? `已校正 ${adjusted} 件家具的位置或朝向` : '',
+        unplaced > 0 ? `${unplaced} 件家具没有安全位置，未自动放置` : '',
+      ].filter(Boolean).join('；');
+      const message = incomplete ? '已使用部分结果，缺失的墙体、房间和门窗需要手动补齐' : '识别完成，可在 2D 视图校正低置信度区域';
+      this.toast(notes ? `${message}；${notes}` : message, incomplete || unplaced > 0 ? 'warning' : 'success');
     };
-
+    applyButton.addEventListener('click', () => {
+      if (!controller && completedPlan) applyPlan(completedPlan);
+    });
+    cancelButton.addEventListener('click', () => { controller?.abort(); });
+    partialButton.addEventListener('click', () => {
+      if (controller || !partialPlan?.walls.length || !partialPlan.rooms.length) return;
+      applyPlan(normalizeFloorPlan(partialPlan), true);
+    });
     recognizeButton.addEventListener('click', async () => {
-      if (!imageDataUrl || !this.config) return;
+      if (!imageDataUrl || !this.config || controller) return;
+      const request = new AbortController();
+      controller = request;
+      requestMode = this.recognitionMode;
+      modeOptions.disabled = true;
+      resetPreview();
+      milestones.clear();
+      events.replaceChildren();
+      receivedChars = 0;
+      lastProgress = { phase: 'connecting', transport: 'direct', receivedChars: 0, partial: null, buffered: false };
+      startedAt = lastContentAt = Date.now();
+      scanTimer.textContent = '00:00';
       recognizeButton.disabled = true;
-      recognizeButton.classList.add('busy');
-      recognizeButton.textContent = '正在识别…';
+      recognizeButton.classList.add('hidden');
       manualButton.disabled = true;
+      cancelButton.classList.remove('hidden');
       errorBox.classList.add('hidden');
       progress.classList.remove('hidden');
-      setStage('upload');
-      startLoading();
+      progress.classList.add('running');
+      previewPanel.classList.remove('hidden');
+      query('#recognition-workspace').classList.add('recognizing');
+      query('#recognition-spinner').classList.remove('hidden');
+      zone.classList.add('scanning');
+      zone.setAttribute('aria-disabled', 'true');
+      log('start', `图片已优化，开始${requestMode === 'fast' ? '快速' : '精细'}识别`);
+      setStage(1);
+      timer = window.setInterval(() => {
+        const seconds = elapsed();
+        scanTimer.textContent = `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
+        updateHint();
+      }, 1000);
       try {
-        const recognizedPlan = await recognizeFloorPlan(this.config, imageDataUrl, setStage);
-        if (cancelled) return;
-        const { plan, adjusted, unplaced } = constrainFurnitureLayout(recognizedPlan);
+        const recognizedPlan = await recognizeFloorPlan(this.config, imageDataUrl, { mode: requestMode, signal: request.signal, onProgress });
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+        if (closed || request.signal.aborted) throw new DOMException('已停止识别', 'AbortError');
+        completedPlan = recognizedPlan;
+        onProgress({ phase: 'validating', transport: lastProgress?.transport ?? 'direct', receivedChars, partial: recognizedPlan, buffered: lastProgress?.buffered ?? false });
+        clearTimeout(previewTimer);
+        previewTimer = 0;
+        renderPreview();
         stopLoading();
-        this.store.replace(plan);
-        this.currentProjectId = null;
-        this.setPlanSourceLabel('AI 识别方案');
-        modal.close();
-        this.setViewMode('split');
-        this.scene.resetCamera();
-        const notes = [
-          adjusted > 0 ? `已校正 ${adjusted} 件家具的位置或朝向` : '',
-          unplaced > 0 ? `${unplaced} 件家具没有安全位置，未自动放置` : '',
-        ].filter(Boolean).join('；');
-        this.toast(notes ? `识别完成；${notes}` : '识别完成，可在 2D 视图校正低置信度区域', unplaced > 0 ? 'warning' : 'success');
+        scanTitle.textContent = '识别完成，等待确认';
+        scanHint.textContent = '可以继续查看和旋转预览；确认后再应用到工作区';
+        query('#recognition-preview-title').textContent = '识别完成 · 待确认';
+        query('#recognition-preview-note').textContent = '数据已通过结构校验。应用后仍可在 2D 中校正尺寸和细节。';
+        applyButton.classList.remove('hidden');
+        recognizeButton.classList.replace('primary-button', 'ghost-button');
+        recognizeButton.textContent = '重新识别';
+        log('complete', '结构校验通过，当前方案未修改，等待你确认应用');
       } catch (error) {
-        if (cancelled) return;
+        if (closed) return;
         stopLoading();
-        progress.classList.add('hidden');
+        const stopped = request.signal.aborted;
+        scanTitle.textContent = stopped ? '已停止识别' : '识别未完成';
+        scanHint.textContent = partialPlan ? '已保留本次预览，当前方案未修改' : '当前方案未修改，可以换图或重试';
+        log(stopped ? 'stopped' : 'failed', stopped ? '你已停止请求' : '请求结束，未自动重新识别');
         errorBox.classList.remove('hidden');
-        errorBox.innerHTML = '';
+        errorBox.replaceChildren();
         const message = document.createElement('div');
-        message.textContent = error instanceof Error ? error.message : '识别失败，请重试。';
+        message.textContent = stopped ? '请求已中止，不会继续等待或自动重试。' : error instanceof Error ? error.message : '识别失败，请重试。';
         errorBox.appendChild(message);
-        if (error instanceof RecognitionError && error.raw) {
+        if (!stopped && error instanceof RecognitionError && error.raw) {
           const details = document.createElement('details');
           details.className = 'raw-output';
           const summary = document.createElement('summary');
-          summary.textContent = '查看模型原始输出（仅保存在本页，用于排查）';
+          summary.textContent = '查看模型原始输出（仅保存在本页）';
           const pre = document.createElement('pre');
           pre.textContent = error.raw.slice(0, 6000);
           details.append(summary, pre);
           errorBox.appendChild(details);
         }
-        recognizeButton.classList.remove('busy');
-        recognizeButton.disabled = false;
-        recognizeButton.textContent = '重试识别';
-        manualButton.disabled = false;
+        if (canUsePartial()) {
+          partialButton.classList.remove('hidden');
+          query('#recognition-preview-note').textContent = '这是不完整结果。使用后需在 2D 中补齐缺失部分，也可重新识别。';
+        }
+        recognizeButton.textContent = '重新识别';
+      } finally {
+        if (controller === request) {
+          controller = null;
+          modeOptions.disabled = false;
+        }
       }
     });
-    modal.element.querySelector('#upload-manual')!.addEventListener('click', () => {
+    manualButton.addEventListener('click', () => {
       modal.close();
       this.store.replace(emptyPlan('未命名户型'));
       this.currentProjectId = null;
@@ -1362,29 +1665,125 @@ export class App {
       this.setTool('wall');
       this.toast('已创建空白户型，拖拽即可画墙', 'info', { label: '撤销', action: () => this.restorePreviousPlan() });
     });
+    this.uploadModal = { ...modal, setFile };
+    if (file) void setFile(file);
   }
 
   private showReplay() {
+    if (this.activeModal?.element.querySelector('#replay-visual')) return;
     const demoId = this.query<HTMLSelectElement>('#demo-select').value;
     const entry = DEMO_PLANS.find((demo) => demo.id === demoId) ?? DEMO_PLANS[1];
+    const plan = getDemoPlan(entry.id);
+    const reviewCount = plan.rooms.filter((room) => room.confidence < 0.75).length;
+    const frames = [
+      { title: '上传示例图纸', detail: `${entry.title}的内置示意图。演示不上传图片、不调用模型，也不会改动当前方案。` },
+      { title: '提取墙体、门窗与房间', detail: `${plan.walls.length} 面墙 · ${plan.openings.length} 处门窗 · ${plan.rooms.length} 个房间。去除家具干扰，用颜色分离房间与墙体。` },
+      { title: '标注尺寸与置信度', detail: `约 ${planArea(plan).toFixed(0)}㎡ · ${reviewCount} 个房间建议检查。尺寸与置信度均来自示例预设，并非本次 AI 测量。` },
+      { title: '生成 3D 沙盘与家具', detail: `${plan.furniture.length} 件示例家具已就位。拖拽旋转、滚轮缩放；确认后再应用到工作区。` },
+    ];
+    const images = (['drawing', 'structure', 'analysis', 'full'] as const).map((mode) => planToDataUrl(plan, 800, mode));
+    let timer = 0;
+    let closed = false;
+    let previewScene: FloorScene | null = null;
+    let previewUnavailable = false;
     const modal = openModal('模拟识别演示', `
-      <p class="modal-note">这是内置示例回放，用于展示“图纸 → 识别 → 3D”的流程，不是真实 AI 识别。真实识别请上传你自己的户型图。</p>
+      <p class="modal-note">内置示例回放 · 非真实 AI 识别 · 无需 API Key。左侧画面随步骤变化，也可点选右侧步骤回看。</p>
       <div class="replay-layout">
-        <img class="replay-plan" src="${planToDataUrl(entry.plan, 560)}" alt="${escapeHtml(entry.title)}示例图纸" />
-        <ol class="replay-steps">
-          <li data-step="0">上传示例图纸</li>
-          <li data-step="1">识别墙体 / 门窗 / 房间</li>
-          <li data-step="2">估算尺寸与置信度</li>
-          <li data-step="3">生成 3D 沙盘与家具</li>
+        <figure class="replay-preview">
+          <div id="replay-visual" data-stage="0">
+            <img id="replay-plan" class="replay-plan" src="${images[0]}" alt="${escapeHtml(entry.title)}示例图纸" />
+            <div id="replay-scene" class="hidden" aria-label="示例户型 3D 沙盘"></div>
+          </div>
+          <figcaption aria-live="polite"><strong id="replay-caption"></strong><span id="replay-detail"></span></figcaption>
+        </figure>
+        <ol class="replay-steps" aria-label="演示步骤">
+          ${frames.map((frame, index) => `<li><button type="button" data-replay-step="${index}"><span class="replay-step-number" aria-hidden="true">0${index + 1}</span><span>${frame.title}</span></button></li>`).join('')}
         </ol>
       </div>
-      <div class="modal-actions"><button id="replay-skip" class="ghost-button" type="button">跳过动画</button><button id="replay-run" class="primary-button" type="button">开始演示</button></div>
-    `, { wide: true, onClose: () => timers.forEach((timer) => clearTimeout(timer)) });
+      <div class="modal-actions replay-actions">
+        <button id="replay-skip" class="ghost-button" type="button">跳过动画</button>
+        <button id="replay-run" class="primary-button" type="button">开始演示</button>
+        <button id="replay-apply" class="primary-button hidden" type="button">应用到工作区</button>
+      </div>
+    `, { wide: true, onClose: () => {
+      closed = true;
+      clearTimeout(timer);
+      previewScene?.dispose();
+      if (this.activeModal === modal) this.activeModal = null;
+    } });
+    modal.element.querySelector('.modal')!.classList.add('replay-modal');
     this.activeModal = modal;
-    const steps = modal.element.querySelectorAll<HTMLElement>('.replay-steps li');
-    const timers: number[] = [];
-    const finish = () => {
-      timers.forEach((timer) => clearTimeout(timer));
+    const query = <T extends HTMLElement = HTMLElement>(selector: string) => modal.element.querySelector<T>(selector)!;
+    const steps = modal.element.querySelectorAll<HTMLButtonElement>('[data-replay-step]');
+    const visual = query('#replay-visual');
+    const image = query<HTMLImageElement>('#replay-plan');
+    const sceneContainer = query('#replay-scene');
+    const runButton = query<HTMLButtonElement>('#replay-run');
+    const skipButton = query<HTMLButtonElement>('#replay-skip');
+    const applyButton = query<HTMLButtonElement>('#replay-apply');
+    const stop = () => {
+      clearTimeout(timer);
+      runButton.disabled = false;
+      runButton.textContent = '重新播放';
+    };
+    const showFrame = (index: number) => {
+      if (closed) return;
+      visual.dataset.stage = String(index);
+      steps.forEach((button, step) => {
+        button.parentElement!.classList.toggle('active', step === index);
+        button.parentElement!.classList.toggle('done', step < index);
+        if (step === index) button.setAttribute('aria-current', 'step');
+        else button.removeAttribute('aria-current');
+      });
+      query('#replay-caption').textContent = `0${index + 1} / 04 · ${frames[index].title}`;
+      query('#replay-detail').textContent = frames[index].detail;
+      image.src = images[index];
+      image.alt = `${entry.title} · ${frames[index].title}`;
+      image.classList.toggle('hidden', index === 3);
+      sceneContainer.classList.toggle('hidden', index !== 3);
+      if (index === 3) {
+        if (!previewScene && !previewUnavailable) {
+          try {
+            previewScene = new FloorScene(sceneContainer, new PlanStore(plan), {
+              onSelectFurniture: () => {}, onSelectRoom: () => {}, onFurnitureTransform: () => {},
+              onFurnitureDragStart: () => {}, onFurnitureDragEnd: () => {}, onPlace: () => {}, onFeedback: () => {},
+            }, true);
+            previewScene.updateSettings({ ...DEFAULT_SCENE_SETTINGS, autoRotate: false, showLabels: false, showGrid: false, quality: 'balanced' });
+          } catch {
+            previewUnavailable = true;
+            sceneContainer.replaceChildren();
+          }
+        }
+        if (previewUnavailable) {
+          image.classList.remove('hidden');
+          sceneContainer.classList.add('hidden');
+          query('#replay-detail').textContent = '当前设备无法创建额外 3D 预览，改为显示家具平面图；仍可应用示例到工作区。';
+        }
+      }
+      applyButton.classList.toggle('hidden', index !== 3);
+      skipButton.classList.toggle('hidden', index === 3);
+      runButton.classList.toggle('primary-button', index !== 3);
+      runButton.classList.toggle('ghost-button', index === 3);
+    };
+    steps.forEach((button, index) => button.addEventListener('click', () => {
+      stop();
+      showFrame(index);
+    }));
+    skipButton.addEventListener('click', () => { stop(); showFrame(3); });
+    runButton.addEventListener('click', () => {
+      if (runButton.disabled) return;
+      stop();
+      runButton.disabled = true;
+      runButton.textContent = '播放中…';
+      const advance = (index: number) => {
+        if (closed) return;
+        showFrame(index);
+        if (index < frames.length - 1) timer = window.setTimeout(() => advance(index + 1), 1800);
+        else stop();
+      };
+      advance(0);
+    });
+    applyButton.addEventListener('click', () => {
       this.store.replace(getDemoPlan(entry.id));
       this.currentProjectId = null;
       this.setPlanSourceLabel(null);
@@ -1392,19 +1791,9 @@ export class App {
       modal.close();
       this.setViewMode('3d');
       this.scene.resetCamera();
-      this.toast('示例演示完成，可自由旋转与摆放家具', 'success');
-    };
-    modal.element.querySelector('#replay-skip')!.addEventListener('click', finish);
-    modal.element.querySelector('#replay-run')!.addEventListener('click', () => {
-      steps.forEach((step) => step.classList.remove('active', 'done'));
-      steps.forEach((step, index) => {
-        timers.push(window.setTimeout(() => {
-          step.classList.add('active');
-          if (index > 0) steps[index - 1].classList.add('done');
-          if (index === steps.length - 1) timers.push(window.setTimeout(finish, 700));
-        }, index * 800));
-      });
+      this.toast('示例已应用，可自由旋转与摆放家具', 'success');
     });
+    showFrame(0);
   }
 
   private showAbout() {
@@ -1416,7 +1805,7 @@ export class App {
           <li>开发：全程使用 Qoder 完成需求、建模、交互与部署</li>
           <li>视角：上帝第三人称斜俯视沙盘，不做第一人称漫游</li>
           <li>隐私：零注册、零埋点、零数据收集；配置与方案仅存浏览器本地；图纸只发送到你自己配置的模型接口</li>
-          <li>模型：22 件原创程序化家具，无外部 GLTF 素材</li>
+          <li>模型：${FURNITURE_CATALOG.length} 件原创程序化家具，无外部 GLTF 素材</li>
         </ul>
         <p class="built-with">Built with Qoder</p>
       </div>

@@ -4,9 +4,11 @@ import { constrainFurnitureLayout } from './layout';
 import { validateFurniture } from './placement';
 import { emptyPlan, normalizeFloorPlan, planArea, scalePlan } from './schema';
 import type { FloorPlan } from './schema';
+import { FURNITURE_CATALOG } from '../models/catalog';
 import type { FurnitureModelId } from '../models/catalog';
 import type { Vec2 } from './geometry';
 import { PlanStore } from './store';
+import { planToSvg } from '../data/planSvg';
 
 describe('示例户型数据', () => {
   it('提供 4 套示例且结构完整', () => {
@@ -37,6 +39,88 @@ describe('示例户型数据', () => {
     const b = getDemoPlan('two-bed');
     a.furniture.pop();
     expect(b.furniture.length).toBeGreaterThan(a.furniture.length);
+  });
+});
+
+describe('扩展家具预设', () => {
+  it('保存并重新导入后保留全部家具类型、配色和变换', () => {
+    const plan = getDemoPlan('two-bed');
+    plan.furniture = FURNITURE_CATALOG.map((definition, index) => ({
+      id: `catalog-${index}`, model: definition.id, color: 'sage',
+      position: [2, 2], rotation: Math.PI / 2, roomId: plan.rooms[0].id,
+    }));
+    const restored = normalizeFloorPlan(JSON.parse(JSON.stringify(plan)));
+    expect(restored.furniture).toEqual(plan.furniture);
+  });
+
+  it.each(FURNITURE_CATALOG.map((item) => item.id))('%s 支持放置、旋转以及边界和重叠检测', (model) => {
+    const plan = normalizeFloorPlan({ rooms: [{ id: 'r1', name: '测试房间', type: 'living', polygon: [[0, 0], [8, 0], [8, 8], [0, 8]] }] });
+    expect(validateFurniture(plan, model, [4, 4], 0).valid).toBe(true);
+    expect(validateFurniture(plan, model, [4, 4], Math.PI / 2).valid).toBe(true);
+    expect(validateFurniture(plan, model, [0.01, 0.01], 0).valid).toBe(false);
+    plan.furniture.push({ id: 'occupied', model, position: [4, 4], rotation: 0, color: 'oak' });
+    expect(validateFurniture(plan, model, [4, 4], 0).valid).toBe(model === 'rug');
+  });
+});
+
+describe('流式户型预览', () => {
+  it('只有墙体时不虚构房间，累积家具后显示对应轮廓', () => {
+    const plan = emptyPlan('实时预览');
+    plan.walls = [{ id: 'w1', start: [0, 0], end: [4, 0], thickness: 0.24 }];
+    const initial = planToSvg(plan);
+    expect(initial).toContain('<line');
+    expect(initial).not.toContain('<polygon');
+    expect(initial).not.toMatch(/NaN|Infinity/);
+    plan.furniture = [{ id: 'f1', model: 'bed-double', position: [2, 2], rotation: Math.PI / 2, color: 'oak' }];
+    const updated = planToSvg(plan);
+    expect(updated).toContain('<title>双人床</title>');
+    expect(updated).toContain('rotate(-90)');
+    expect(plan.rooms).toEqual([]);
+  });
+
+  it('对来自模型的名称转义，不向预览注入标记', () => {
+    const plan = getDemoPlan('two-bed');
+    plan.name = '<script>alert(1)</script>';
+    plan.rooms[0].name = '<img src=x onerror=alert(1)>';
+    for (const mode of ['full', 'drawing', 'structure', 'analysis'] as const) {
+      const svg = planToSvg(plan, 720, mode);
+      expect(svg).not.toContain('<script>');
+      expect(svg).not.toContain('<img');
+      expect(svg).toContain('&lt;img');
+    }
+  });
+
+  it('演示图纸、结构与尺寸阶段分别呈现对应信息，保留默认预览', () => {
+    for (const demo of DEMO_PLANS) {
+      const plan = getDemoPlan(demo.id);
+      const original = structuredClone(plan);
+      const drawing = planToSvg(plan, 800, 'drawing');
+      const structure = planToSvg(plan, 800, 'structure');
+      const analysis = planToSvg(plan, 800, 'analysis');
+      expect(new Set([drawing, structure, analysis]).size).toBe(3);
+      expect(drawing).toContain('内置示意图');
+      expect(drawing).toContain('<title>');
+      expect(drawing).not.toContain('㎡');
+      expect(structure).toContain('结构分层 · 模拟');
+      expect(structure).not.toContain('<title>');
+      expect(structure).not.toContain('㎡');
+      expect(analysis).toContain('置信度');
+      expect(analysis).toContain('㎡');
+      expect(analysis).not.toContain('<title>');
+      expect(planToSvg(plan)).toBe(planToSvg(plan, 720, 'full'));
+      expect(plan).toEqual(original);
+    }
+  });
+
+  it('演示按示例真实置信度标注，仅对低置信度房间提示检查', () => {
+    const plan = getDemoPlan('two-bed');
+    plan.rooms[0].confidence = 0.52;
+    plan.rooms[1].confidence = 0.99;
+    const svg = planToSvg(plan, 800, 'analysis');
+    expect(svg).toContain('置信度 52% · 建议检查');
+    expect(svg).toContain('置信度 99%');
+    expect(svg).not.toContain('置信度 99% · 建议检查');
+    expect(svg).toContain('#eed0a4');
   });
 });
 

@@ -4,6 +4,52 @@ interface ProxyBody {
   payload?: unknown;
 }
 
+function forwardStream(body: ReadableStream<Uint8Array>, cancellation: AbortController, signal: AbortSignal): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  let settled = false;
+  let onAbort: () => void;
+  const cleanup = () => {
+    settled = true;
+    signal.removeEventListener('abort', onAbort);
+  };
+  const cancelReader = (reason: unknown) => reader.cancel(reason).catch(() => {}).finally(() => reader.releaseLock());
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      onAbort = () => {
+        if (settled) return;
+        cleanup();
+        controller.error(signal.reason);
+        void cancelReader(signal.reason);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    },
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (settled) return;
+        if (done) {
+          cleanup();
+          reader.releaseLock();
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+      } catch (error) {
+        if (settled) return;
+        cleanup();
+        reader.releaseLock();
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      cleanup();
+      cancellation.abort(reason);
+      return cancelReader(reason);
+    },
+  }, { highWaterMark: 0 });
+}
+
 export async function handleModelProxy(request: Request): Promise<Response> {
   if (request.method !== 'POST') {
     return Response.json({ error: { message: '仅支持 POST 转发。' } }, { status: 405 });
@@ -27,6 +73,9 @@ export async function handleModelProxy(request: Request): Promise<Response> {
     return Response.json({ error: { message: '转发函数仅允许 HTTPS 接口；本地 HTTP 接口请由浏览器直连。' } }, { status: 400 });
   }
   try {
+    const cancellation = new AbortController();
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(290_000), cancellation.signal]);
+    signal.throwIfAborted();
     const upstream = await fetch(target, {
       method: 'POST',
       headers: {
@@ -34,12 +83,15 @@ export async function handleModelProxy(request: Request): Promise<Response> {
         Authorization: `Bearer ${body.apiKey}`,
       },
       body: JSON.stringify(body.payload),
-      signal: AbortSignal.timeout(290_000),
+      signal,
     });
-    const text = await upstream.text();
-    return new Response(text, {
+    return new Response(upstream.body ? forwardStream(upstream.body, cancellation, signal) : null, {
       status: upstream.status,
-      headers: { 'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json' },
+      headers: {
+        'Content-Type': upstream.headers.get('Content-Type') ?? 'application/json',
+        'Cache-Control': 'no-store, no-cache, no-transform',
+        'X-Accel-Buffering': 'no',
+      },
     });
   } catch {
     return Response.json({ error: { message: '转发请求失败，请检查接口地址是否可公开访问。' } }, { status: 502 });
